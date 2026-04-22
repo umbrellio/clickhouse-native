@@ -99,8 +99,13 @@ client.close
 | `compression:`| `:none`       | `:none`, `:lz4`, or `:zstd`                         |
 | `logger:`     | `nil`         | any `Logger`-compatible object (see [Logging](#logging)) |
 
-`Pool.new` additionally accepts `pool_size:` (default 5) and `pool_timeout:`
-(default 5, seconds).
+`Pool.new` additionally accepts:
+
+| kwarg           | default | notes                                                    |
+| --------------- | ------- | -------------------------------------------------------- |
+| `pool_size:`    | `5`     |                                                          |
+| `pool_timeout:` | `5`     | seconds                                                  |
+| `settings:`     | `{}`    | session settings applied to every client in the pool (see [Session settings](#session-settings)) |
 
 ## API
 
@@ -211,9 +216,11 @@ further calls raise `ClickhouseNative::ConnectionError`.
 ## Connection pooling
 
 `ClickhouseNative::Pool` wraps [`connection_pool`](https://github.com/mperham/connection_pool)
-and exposes the same surface as `Client` (minus `close` / `reset_connection`).
-Because the extension releases the GVL during I/O, N threads on a pool of
-size N scale roughly linearly on I/O-bound work.
+and exposes the same surface as `Client` (minus `close` / `reset_connection`),
+plus `#host`, `#port`, `#database` attr readers so callers can introspect a
+pool's endpoint without checking out a connection. Because the extension
+releases the GVL during I/O, N threads on a pool of size N scale roughly
+linearly on I/O-bound work.
 
 ```ruby
 pool = ClickhouseNative::Pool.new(
@@ -229,6 +236,27 @@ pool.with do |client|          # for multi-statement work on one connection
   client.query("SELECT sum(n) FROM t")
 end
 ```
+
+### Session settings
+
+Pass `settings:` to `Pool.new` to apply ClickHouse session settings to every
+client the pool creates. Each checked-out connection starts from the same
+session state — equivalent to sending `?key=value` URL params on every
+HTTP request.
+
+```ruby
+pool = ClickhouseNative::Pool.new(
+  host: "localhost", port: 9000,
+  settings: {
+    allow_experimental_analyzer: 1,
+    do_not_merge_across_partitions_select_final: 1,
+    max_execution_time: 60,
+  },
+)
+```
+
+Integer and Float values render bare (`SET allow_experimental_analyzer = 1`);
+anything else is quoted as a SQL string literal.
 
 ## Type mapping
 
