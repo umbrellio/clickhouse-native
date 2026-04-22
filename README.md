@@ -171,8 +171,11 @@ client.insert("events", [
 ])
 
 # Subset of columns (hash keys not in the schema would raise ArgumentError):
-client.insert("events", [{ id: 1, user: "a" }],
-              columns: %w[id user])
+client.insert(
+  "events",
+  [{ id: 1, user: "a" }],
+  columns: %w[id user],
+)
 
 # Positional rows, cross-database:
 client.insert("events", [[1, "a", [], Time.now.utc]], db_name: "analytics")
@@ -183,9 +186,12 @@ column types. If you already know them (e.g. you're inserting to the same
 table in a tight loop), pass them to skip the round-trip:
 
 ```ruby
-client.insert("events", rows,
-              columns: %w[id user tags happened],
-              types: %w[UInt64 LowCardinality(String) Array(String) DateTime64(6,'UTC')])
+client.insert(
+  "events",
+  rows,
+  columns: %w[id user tags happened],
+  types: %w[UInt64 LowCardinality(String) Array(String) DateTime64(6,'UTC')],
+)
 ```
 
 Returns the number of rows inserted. An empty `rows` array is a no-op and
@@ -386,3 +392,11 @@ bundle exec ruby benchmark/threaded.rb   # GVL release / scaling
 
 Apache-2.0. The vendored clickhouse-cpp and its transitive contribs
 (absl, cityhash, lz4, zstd) ship under their own upstream licenses.
+
+## Authors
+
+Created by Claude AI with some help of Yuri Smirnov.
+
+<a href="https://github.com/umbrellio/">
+<img style="float: left;" src="https://umbrellio.github.io/Umbrellio/supported_by_umbrellio.svg" alt="Supported by Umbrellio" width="439" height="72">
+</a>
