@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module ClickhouseNative
   class Client
     attr_reader :host, :port, :database
@@ -18,36 +20,47 @@ module ClickhouseNative
     # to insert a subset, pass `columns:` explicitly.
     def insert(table, rows, columns: nil, db_name: nil, types: nil)
       return 0 if rows.empty?
+
       fq = db_name ? "#{db_name}.#{table}" : table
-
-      if types && columns
-        raise ArgumentError, "types and columns must have the same length" if columns.size != types.size
-        col_pairs = columns.zip(types).map { |n, t| [n.to_s, t] }
-      else
-        schema = describe_table(table, db_name: db_name)
-        type_by_name = schema.to_h { |c| [c[:name], c[:type]] }
-        columns ||= rows.first.is_a?(Hash) ? rows.first.keys.map(&:to_s) : schema.map { |c| c[:name] }
-        col_pairs = columns.map do |name|
-          name_s = name.to_s
-          t = type_by_name[name_s] or raise ArgumentError, "unknown column #{name_s.inspect} in #{fq}"
-          [name_s, t]
-        end
-      end
-
-      row_arrays =
-        if rows.first.is_a?(Hash)
-          col_pairs.map { |n, _| [n.to_sym, n] }.then do |lookup|
-            rows.map { |h| lookup.map { |sym, str| h.fetch(sym) { h[str] } } }
-          end
+      col_pairs =
+        if types && columns
+          zip_columns_and_types(columns, types)
         else
-          rows
+          columns_from_schema(table, rows, columns, db_name, fq)
         end
+      row_arrays = rows.first.is_a?(Hash) ? hash_rows_to_arrays(rows, col_pairs) : rows
 
       insert_block(fq, col_pairs, row_arrays)
     end
 
     def inspect
       "#<#{self.class} #{host}:#{port}/#{database}>"
+    end
+
+    private
+
+    def zip_columns_and_types(columns, types)
+      if columns.size != types.size
+        raise ArgumentError, "types and columns must have the same length"
+      end
+      columns.zip(types).map { |n, t| [n.to_s, t] }
+    end
+
+    def columns_from_schema(table, rows, columns, db_name, fqn)
+      schema = describe_table(table, db_name: db_name)
+      type_by_name = schema.to_h { |c| [c[:name], c[:type]] }
+      columns ||= rows.first.is_a?(Hash) ? rows.first.keys.map(&:to_s) : schema.map { |c| c[:name] }
+      columns.map do |name|
+        name_s = name.to_s
+        t = type_by_name[name_s] or
+          raise ArgumentError, "unknown column #{name_s.inspect} in #{fqn}"
+        [name_s, t]
+      end
+    end
+
+    def hash_rows_to_arrays(rows, col_pairs)
+      lookup = col_pairs.map { |n, _| [n.to_sym, n] }
+      rows.map { |h| lookup.map { |sym, str| h.fetch(sym) { h[str] } } }
     end
   end
 end

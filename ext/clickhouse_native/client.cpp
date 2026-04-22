@@ -383,6 +383,11 @@ static void append_value(const ColumnRef& col, VALUE value) {
     if (value == Qtrue) value = INT2FIX(1);
     else if (value == Qfalse) value = INT2FIX(0);
 
+    // Symbol -> String: common for LowCardinality/String columns where
+    // callers naturally use :pt, :eur, etc. Matches how JSON serialization
+    // in the HTTP path rendered them.
+    if (SYMBOL_P(value)) value = rb_funcall(value, rb_intern("to_s"), 0);
+
     switch (type->GetCode()) {
         case Type::Int8:    col->As<ColumnInt8>()->Append(NUM2INT(value)); return;
         case Type::Int16:   col->As<ColumnInt16>()->Append(NUM2INT(value)); return;

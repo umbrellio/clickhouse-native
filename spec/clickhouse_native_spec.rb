@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 RSpec.describe ClickhouseNative do
   it "has a version number" do
     expect(ClickhouseNative::VERSION).to match(/\A\d+\.\d+\.\d+/)
@@ -6,6 +8,7 @@ end
 
 RSpec.describe ClickhouseNative::Client, :clickhouse do
   subject(:client) { described_class.new(**CH_KWARGS) }
+
   after { client.close }
 
   describe "connection attributes" do
@@ -53,7 +56,7 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
   describe "#query" do
     it "returns an array of symbol-keyed hashes" do
       rows = client.query("SELECT 1 AS a, 2 AS b UNION ALL SELECT 3 AS a, 4 AS b ORDER BY a")
-      expect(rows).to eq([{a: 1, b: 2}, {a: 3, b: 4}])
+      expect(rows).to eq([{ a: 1, b: 2 }, { a: 3, b: 4 }])
     end
 
     it "handles no-row results" do
@@ -93,13 +96,15 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
       end
 
       it "decodes Decimal round-trip as BigDecimal" do
-        row = client.query("SELECT toDecimal64('123.456789', 6) AS d, toDecimal128('-1.5', 2) AS e").first
+        sql = "SELECT toDecimal64('123.456789', 6) AS d, toDecimal128('-1.5', 2) AS e"
+        row = client.query(sql).first
         expect(row[:d]).to eq(BigDecimal("123.456789"))
         expect(row[:e]).to eq(BigDecimal("-1.5"))
       end
 
       it "decodes Float32 / Float64" do
-        row = client.query("SELECT toFloat32(1.5) AS f32, toFloat64(3.141592653589793) AS f64").first
+        sql = "SELECT toFloat32(1.5) AS f32, toFloat64(3.141592653589793) AS f64"
+        row = client.query(sql).first
         expect(row[:f32]).to be_within(1e-6).of(1.5)
         expect(row[:f64]).to eq(3.141592653589793)
       end
@@ -118,14 +123,16 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
       end
 
       it "decodes Array(T) recursively" do
-        row = client.query("SELECT [1, 2, 3]::Array(UInt32) AS a, [['x'], ['y', 'z']]::Array(Array(String)) AS aa").first
+        sql = "SELECT [1, 2, 3]::Array(UInt32) AS a, " \
+              "[['x'], ['y', 'z']]::Array(Array(String)) AS aa"
+        row = client.query(sql).first
         expect(row[:a]).to eq([1, 2, 3])
-        expect(row[:aa]).to eq([["x"], ["y", "z"]])
+        expect(row[:aa]).to eq([["x"], %w[y z]])
       end
 
       it "decodes Map(K, V)" do
         row = client.query("SELECT map('a', 1, 'b', 2)::Map(String, Int32) AS m").first
-        expect(row[:m]).to eq({"a" => 1, "b" => 2})
+        expect(row[:m]).to eq({ "a" => 1, "b" => 2 })
       end
 
       it "decodes Tuple(...)" do
@@ -134,7 +141,8 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
       end
 
       it "decodes Enum8 as a Symbol name" do
-        row = client.query("SELECT CAST('blue' AS Enum8('red' = 1, 'green' = 2, 'blue' = 3)) AS c").first
+        sql = "SELECT CAST('blue' AS Enum8('red' = 1, 'green' = 2, 'blue' = 3)) AS c"
+        row = client.query(sql).first
         expect(row[:c]).to eq(:blue)
       end
     end
@@ -180,27 +188,28 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         ) ENGINE = Memory
       SQL
     end
+
     after { client.execute("DROP DATABASE chn_ins_test") }
 
     let(:t) { Time.utc(2026, 4, 22, 10, 30, 0, 123_456) }
 
     it "inserts an Array<Hash>, round-trips via SELECT" do
       client.insert("t", [
-        {id: 1, name: "a", score: 1.5, tags: ["x"],         created: t},
-        {id: 2, name: "b", score: nil, tags: ["y", "z"],    created: t},
+        { id: 1, name: "a", score: 1.5, tags: ["x"], created: t },
+        { id: 2, name: "b", score: nil, tags: %w[y z], created: t },
       ], db_name: "chn_ins_test")
 
       rows = client.query("SELECT id, name, score, tags, created FROM chn_ins_test.t ORDER BY id")
       expect(rows.size).to eq(2)
       expect(rows[0]).to include(id: 1, name: "a", score: 1.5, tags: ["x"])
       expect(rows[0][:created].usec).to eq(123_456)
-      expect(rows[1]).to include(id: 2, name: "b", score: nil, tags: ["y", "z"])
+      expect(rows[1]).to include(id: 2, name: "b", score: nil, tags: %w[y z])
     end
 
     it "inserts Array<Array> with explicit columns in table order" do
       client.insert("t",
-        [[10, "c", nil, [], t]],
-        db_name: "chn_ins_test")
+                    [[10, "c", nil, [], t]],
+                    db_name: "chn_ins_test")
       expect(client.query_value("SELECT name FROM chn_ins_test.t WHERE id = 10")).to eq("c")
     end
 
@@ -211,9 +220,9 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
 
     it "surfaces EncoderError when a column type is unsupported for insert" do
       client.execute("CREATE TABLE chn_ins_test.u (m Map(String, Int32)) ENGINE = Memory")
-      expect {
-        client.insert("u", [{m: {"a" => 1}}], db_name: "chn_ins_test")
-      }.to raise_error(ClickhouseNative::EncoderError, /Map/)
+      expect do
+        client.insert("u", [{ m: { "a" => 1 } }], db_name: "chn_ins_test")
+      end.to raise_error(ClickhouseNative::EncoderError, /Map/)
     end
 
     it "inserts into LowCardinality(String) and LowCardinality(Nullable(String))" do
@@ -224,13 +233,13 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         ) ENGINE = Memory
       SQL
       client.insert("lc", [
-        {category: "a", tag: "x"},
-        {category: "b", tag: nil},
+        { category: "a", tag: "x" },
+        { category: "b", tag: nil },
       ], db_name: "chn_ins_test")
       rows = client.query("SELECT category, tag FROM chn_ins_test.lc ORDER BY category")
       expect(rows).to eq([
-        {category: "a", tag: "x"},
-        {category: "b", tag: nil},
+        { category: "a", tag: "x" },
+        { category: "b", tag: nil },
       ])
     end
   end
@@ -239,7 +248,7 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
     it "yields each row to the block" do
       rows = []
       client.query_each("SELECT number AS n FROM numbers(5)") { |row| rows << row }
-      expect(rows).to eq([{n: 0}, {n: 1}, {n: 2}, {n: 3}, {n: 4}])
+      expect(rows).to eq([{ n: 0 }, { n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }])
     end
 
     it "streams large result sets without materialising an array" do
@@ -249,11 +258,11 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
     end
 
     it "propagates an exception raised inside the block and keeps the client usable" do
-      expect {
+      expect do
         client.query_each("SELECT number FROM numbers(100)") do |row|
           raise "boom" if row[:number] == 3
         end
-      }.to raise_error("boom")
+      end.to raise_error("boom")
       # Connection was auto-reset; the client still works.
       expect(client.query_value("SELECT 1")).to eq(1)
     end
@@ -297,7 +306,9 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
   describe "#close" do
     it "releases the connection; subsequent calls raise ConnectionError" do
       client.close
-      expect { client.query("SELECT 1") }.to raise_error(ClickhouseNative::ConnectionError, /closed/)
+      expect do
+        client.query("SELECT 1")
+      end.to raise_error(ClickhouseNative::ConnectionError, /closed/)
     end
   end
 
@@ -310,7 +321,7 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
   describe "logger" do
     it "logs each SQL statement with elapsed time at :debug" do
       io = StringIO.new
-      logger = Logger.new(io, level: :debug, formatter: ->(_, _, _, m) { "#{m}\n" })
+      logger = Logger.new(io, level: :debug, formatter: -> (_, _, _, m) { "#{m}\n" })
       c = described_class.new(**CH_KWARGS, logger: logger)
       c.query_value("SELECT 42")
       c.close
@@ -320,7 +331,7 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
 
     it "logs errors at :error" do
       io = StringIO.new
-      logger = Logger.new(io, level: :debug, formatter: ->(sev, _, _, m) { "#{sev}: #{m}\n" })
+      logger = Logger.new(io, level: :debug, formatter: -> (sev, _, _, m) { "#{sev}: #{m}\n" })
       c = described_class.new(**CH_KWARGS, logger: logger)
       expect { c.query("SELECT no_such_function()") }.to raise_error(ClickhouseNative::ServerError)
       c.close

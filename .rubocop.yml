@@ -1,0 +1,19 @@
+inherit_gem:
+  rubocop-config-umbrellio: lib/rubocop.yml
+
+AllCops:
+  TargetRubyVersion: 3.3
+  NewCops: enable
+  Exclude:
+    - "ext/clickhouse_native/vendor/**/*"
+    - "pkg/**/*"
+    - "tmp/**/*"
+    - "vendor/**/*"
+
+# mkmf exposes $CXXFLAGS / $LDFLAGS / $objs etc. as globals; we have to use them.
+Style/GlobalVars:
+  Exclude:
+    - "ext/**/extconf.rb"
+
+Metrics/ParameterLists:
+  CountKeywordArgs: false

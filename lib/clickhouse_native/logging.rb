@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module ClickhouseNative
   # Sequel-style logging wrapper. Prepended onto Client so it fires for the
   # raw C-level execute/query/query_value/query_each/insert_block calls.
@@ -10,24 +12,25 @@ module ClickhouseNative
   module Logging
     LEVEL = :debug
 
-    def execute(sql, *a, **kw)
+    def execute(sql)
       log_sql(sql) { super }
     end
 
-    def query(sql, *a, **kw)
+    def query(sql)
       log_sql(sql) { super }
     end
 
-    def query_value(sql, *a, **kw)
+    def query_value(sql)
       log_sql(sql) { super }
     end
 
-    def query_each(sql, *a, **kw, &block)
+    def query_each(sql, &)
       log_sql(sql) { super }
     end
 
     def insert_block(table, columns, rows)
-      log_sql("INSERT INTO #{table} (#{columns.map(&:first).join(', ')}) VALUES (#{rows.size} rows)") { super }
+      col_list = columns.map(&:first).join(", ")
+      log_sql("INSERT INTO #{table} (#{col_list}) VALUES (#{rows.size} rows)") { super }
     end
 
     private
@@ -39,11 +42,15 @@ module ClickhouseNative
       begin
         result = yield
         elapsed_ms = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000
-        @logger.public_send(LEVEL, format("(%.3fms) %s", elapsed_ms, sql))
+        @logger.public_send(LEVEL, format("(%<ms>.3fms) %<sql>s", ms: elapsed_ms, sql: sql))
         result
-      rescue => e
+      rescue => error
         elapsed_ms = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000
-        @logger.error(format("(%.3fms) %s: %s -- %s", elapsed_ms, e.class, e.message.to_s.lines.first.to_s.strip, sql))
+        first_line = error.message.to_s.lines.first.to_s.strip
+        @logger.error(format(
+                        "(%<ms>.3fms) %<class>s: %<msg>s -- %<sql>s",
+                        ms: elapsed_ms, class: error.class, msg: first_line, sql: sql,
+                      ))
         raise
       end
     end
@@ -51,6 +58,7 @@ module ClickhouseNative
 
   class Client
     attr_accessor :logger
+
     prepend Logging
   end
 end

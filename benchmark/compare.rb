@@ -1,4 +1,6 @@
 #!/usr/bin/env ruby
+# frozen_string_literal: true
+
 # Compare native TCP driver vs click_house HTTP gem on a few representative
 # workloads. Assumes a ClickHouse server at localhost:9000 (native) and
 # localhost:8123 (HTTP).
@@ -26,7 +28,7 @@ CH_HTTP = ClickHouse.connection
 
 TINY_SQL = "SELECT 1"
 
-MEDIUM_SQL = <<~SQL.freeze
+MEDIUM_SQL = <<~SQL
   SELECT
     toInt64(number)                              AS i,
     toString(number)                             AS s,
@@ -37,7 +39,7 @@ MEDIUM_SQL = <<~SQL.freeze
   FROM numbers(1000)
 SQL
 
-LARGE_SQL = <<~SQL.freeze
+LARGE_SQL = <<~SQL
   SELECT
     toInt64(number)                              AS i,
     toString(number)                             AS s,
@@ -79,7 +81,7 @@ CHN.execute(<<~SQL)
 SQL
 
 ROWS_1K = Array.new(1000) do |i|
-  {id: i, s: "row-#{i}", f: i / 3.14, t: Time.utc(2026, 4, 22, 10, 0, 0, 123_456)}
+  { id: i, s: "row-#{i}", f: i / 3.14, t: Time.utc(2026, 4, 22, 10, 0, 0, 123_456) }
 end
 
 puts "insert(1k rows): warming up..."
@@ -94,7 +96,9 @@ Benchmark.ips do |x|
     CHN.execute("TRUNCATE TABLE chn_bench.t")
   end
   x.report("http:insert(1k)") do
-    CH_HTTP.insert("chn_bench.t", ROWS_1K.map { |r| r.merge(t: r[:t].strftime("%Y-%m-%d %H:%M:%S.%6N")) })
+    CH_HTTP.insert("chn_bench.t", ROWS_1K.map do |r|
+      r.merge(t: r[:t].strftime("%Y-%m-%d %H:%M:%S.%6N"))
+    end)
     CH_HTTP.execute("TRUNCATE TABLE chn_bench.t")
   end
   x.compare!

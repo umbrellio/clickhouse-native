@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "mkmf"
 require "fileutils"
 require "etc"
@@ -78,7 +80,7 @@ configure_args = [
   "-DBUILD_TESTS=OFF",
   "-DWITH_OPENSSL=OFF",
   "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-  "-DCMAKE_BUILD_TYPE=Release",
+  "-DCMAKE_BUILD_TYPE=Release"
 ]
 
 if darwin_cross
@@ -101,7 +103,8 @@ if darwin_cross
 end
 
 unless File.exist?(File.join(BUILD_DIR, "CMakeCache.txt"))
-  system(build_env, *configure_args) or fatal("cmake configure failed. See #{BUILD_DIR}/CMakeFiles/CMakeOutput.log")
+  system(build_env, *configure_args) or
+    fatal("cmake configure failed. See #{BUILD_DIR}/CMakeFiles/CMakeOutput.log")
 end
 
 jobs = ENV.fetch("MAKE_JOBS") { Etc.nprocessors.to_s }

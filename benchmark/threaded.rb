@@ -1,4 +1,6 @@
 #!/usr/bin/env ruby
+# frozen_string_literal: true
+
 # Demonstrates that the GVL is released during clickhouse-cpp I/O, so N
 # worker threads on a pool of size N complete roughly in 1/N wall time
 # of a serial loop.
@@ -39,10 +41,13 @@ def run_parallel(threads:)
 end
 
 serial_t = run_serial
-puts format("serial (%2d jobs):          %.3fs", JOBS, serial_t)
+puts format("serial (%<jobs>2d jobs):          %<time>.3fs", jobs: JOBS, time: serial_t)
 
 [2, 4, 8, 16].each do |n|
   parallel_t = run_parallel(threads: n)
   speedup = serial_t / parallel_t
-  puts format("parallel (%2d threads, %2d jobs): %.3fs  (%.2fx vs serial)", n, JOBS, parallel_t, speedup)
+  puts format(
+    "parallel (%<threads>2d threads, %<jobs>2d jobs): %<time>.3fs  (%<speedup>.2fx vs serial)",
+    threads: n, jobs: JOBS, time: parallel_t, speedup: speedup,
+  )
 end
