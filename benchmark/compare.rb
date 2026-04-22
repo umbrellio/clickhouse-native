@@ -14,6 +14,12 @@ HOST = ENV.fetch("CLICKHOUSE_HOST", "localhost")
 NATIVE_PORT = Integer(ENV.fetch("CLICKHOUSE_NATIVE_PORT", "9000"))
 HTTP_PORT = Integer(ENV.fetch("CLICKHOUSE_HTTP_PORT", "8123"))
 
+ClickhouseNative.configure do |c|
+  c.host = HOST
+  c.port = NATIVE_PORT
+  c.pool_size = 1
+end
+
 ClickHouse.config do |c|
   c.adapter = :net_http
   c.url = "http://#{HOST}:#{HTTP_PORT}"
@@ -45,7 +51,7 @@ LARGE_SQL = <<~SQL.freeze
 SQL
 
 def bench_pair(label, sql)
-  native_rows = ClickhouseNative.query(sql, HOST, NATIVE_PORT)
+  native_rows = ClickhouseNative.query(sql)
   http_rows = CH_HTTP.select_all(sql).to_a
 
   puts "#{label}: native=#{native_rows.size} rows, http=#{http_rows.size} rows"
@@ -53,7 +59,7 @@ def bench_pair(label, sql)
   Benchmark.ips do |x|
     x.warmup = 1
     x.time = 3
-    x.report("native:#{label}") { ClickhouseNative.query(sql, HOST, NATIVE_PORT) }
+    x.report("native:#{label}") { ClickhouseNative.query(sql) }
     x.report("http:#{label}")   { CH_HTTP.select_all(sql).to_a }
     x.compare!
   end

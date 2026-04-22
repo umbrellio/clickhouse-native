@@ -3,6 +3,11 @@ require "clickhouse_native"
 CH_HOST = ENV.fetch("CLICKHOUSE_HOST", "localhost")
 CH_PORT = Integer(ENV.fetch("CLICKHOUSE_PORT", "9000"))
 
+ClickhouseNative.configure do |c|
+  c.host = CH_HOST
+  c.port = CH_PORT
+end
+
 RSpec.configure do |config|
   config.expect_with :rspec do |c|
     c.syntax = :expect

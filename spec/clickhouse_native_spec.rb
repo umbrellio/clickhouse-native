@@ -10,18 +10,18 @@ RSpec.describe ClickhouseNative do
   end
 
   describe ".query", :clickhouse do
-    def query(sql) = ClickhouseNative.query(sql, CH_HOST, CH_PORT)
-
     it "returns an array of symbol-keyed hashes" do
-      rows = query("SELECT 1 AS a, 2 AS b UNION ALL SELECT 3 AS a, 4 AS b ORDER BY a")
+      rows = ClickhouseNative.query("SELECT 1 AS a, 2 AS b UNION ALL SELECT 3 AS a, 4 AS b ORDER BY a")
       expect(rows).to eq([{a: 1, b: 2}, {a: 3, b: 4}])
     end
 
     it "handles no-row results" do
-      expect(query("SELECT 1 WHERE 0")).to eq([])
+      expect(ClickhouseNative.query("SELECT 1 WHERE 0")).to eq([])
     end
 
     context "type codec" do
+      def query(sql) = ClickhouseNative.query(sql)
+
       it "decodes String / LowCardinality(String) / FixedString" do
         row = query(<<~SQL).first
           SELECT
@@ -38,14 +38,10 @@ RSpec.describe ClickhouseNative do
       it "decodes integer widths" do
         row = query(<<~SQL).first
           SELECT
-            toInt8(-128)                           AS i8,
-            toInt16(-32768)                        AS i16,
-            toInt32(-2147483648)                   AS i32,
-            toInt64(-9223372036854775808)          AS i64,
-            toUInt8(255)                           AS u8,
-            toUInt16(65535)                        AS u16,
-            toUInt32(4294967295)                   AS u32,
-            toUInt64(18446744073709551615)         AS u64
+            toInt8(-128) AS i8, toInt16(-32768) AS i16,
+            toInt32(-2147483648) AS i32, toInt64(-9223372036854775808) AS i64,
+            toUInt8(255) AS u8, toUInt16(65535) AS u16,
+            toUInt32(4294967295) AS u32, toUInt64(18446744073709551615) AS u64
         SQL
         expect(row[:i8]).to eq(-128)
         expect(row[:i16]).to eq(-32_768)
@@ -70,7 +66,7 @@ RSpec.describe ClickhouseNative do
         expect(row[:t].usec).to eq(654_321)
       end
 
-      it "decodes Nullable(T) with both null and non-null values" do
+      it "decodes Nullable(T)" do
         row = query("SELECT NULL::Nullable(String) AS a, toNullable('x') AS b").first
         expect(row[:a]).to be_nil
         expect(row[:b]).to eq("x")
@@ -87,7 +83,7 @@ RSpec.describe ClickhouseNative do
         expect(row[:m]).to eq({"a" => 1, "b" => 2})
       end
 
-      it "decodes Tuple(T1, T2, ...)" do
+      it "decodes Tuple(...)" do
         row = query("SELECT (1, 'two', 3.0)::Tuple(UInt8, String, Float64) AS t").first
         expect(row[:t]).to eq([1, "two", 3.0])
       end
@@ -98,30 +94,103 @@ RSpec.describe ClickhouseNative do
       end
     end
 
-    it "surfaces a server error as a Ruby exception" do
-      expect { query("SELECT no_such_function()") }.to raise_error(RuntimeError, /clickhouse-native/)
+    context "advanced types not supported by clickhouse-cpp v2.6.1" do
+      it "rejects Dynamic with UnsupportedTypeError" do
+        expect { ClickhouseNative.query("SELECT CAST(42 AS Dynamic) AS d") }
+          .to raise_error(ClickhouseNative::UnsupportedTypeError, /Dynamic/)
+      end
+
+      it "rejects Variant with UnsupportedTypeError" do
+        expect { ClickhouseNative.query("SELECT CAST(toUInt64(42), 'Variant(UInt64, String)') AS v") }
+          .to raise_error(ClickhouseNative::UnsupportedTypeError, /Variant/)
+      end
+
+      it "rejects typed JSON with UnsupportedTypeError" do
+        expect { ClickhouseNative.query("SELECT CAST('{\"a\":1}', 'JSON') AS j") }
+          .to raise_error(ClickhouseNative::UnsupportedTypeError, /JSON/)
+      end
+    end
+  end
+
+  describe "error mapping", :clickhouse do
+    it "raises ServerError with code/name/message on server-side failures" do
+      expect { ClickhouseNative.query("SELECT no_such_function()") }.to raise_error do |err|
+        expect(err).to be_a(ClickhouseNative::ServerError)
+        expect(err.server_code).to be_a(Integer)
+        expect(err.server_name).to be_a(String).and include("DB::Exception")
+        expect(err.message).to include("no_such_function")
+      end
     end
 
-    # Spike 3 findings: clickhouse-cpp v2.6.1 has no ColumnDynamic / ColumnVariant
-    # / typed-JSON implementation. The column factory throws at block parse
-    # before our codec runs. These specs pin that behaviour so call sites can
-    # catch the exception and fall back (server-side toString() rewrite) until
-    # a proper implementation lands.
-    context "advanced types (not supported by clickhouse-cpp v2.6.1)" do
-      it "rejects Dynamic columns with a clear message" do
-        expect { query("SELECT CAST(42 AS Dynamic) AS d") }
-          .to raise_error(RuntimeError, /unsupported column type: Dynamic/)
-      end
+    it "raises ConnectionError when the host is unreachable" do
+      expect { ClickhouseNative::Client.new(host: "127.0.0.1", port: 6553) }
+        .to raise_error(ClickhouseNative::ConnectionError)
+    end
+  end
 
-      it "rejects Variant columns with a clear message" do
-        expect { query("SELECT CAST(toUInt64(42), 'Variant(UInt64, String)') AS v") }
-          .to raise_error(RuntimeError, /unsupported column type: Variant/)
-      end
+  describe ClickhouseNative::Client, :clickhouse do
+    subject(:client) { described_class.new(host: CH_HOST, port: CH_PORT) }
+    after { client.close }
 
-      it "rejects typed JSON columns with a clear message" do
-        expect { query("SELECT CAST('{\"a\":1}', 'JSON') AS j") }
-          .to raise_error(RuntimeError, /unsupported column type: JSON/)
-      end
+    it "exposes host/port/database" do
+      expect(client.host).to eq(CH_HOST)
+      expect(client.port).to eq(CH_PORT)
+      expect(client.database).to eq("default")
+    end
+
+    it "#ping returns true" do
+      expect(client.ping).to be(true)
+    end
+
+    it "#server_version returns a version string" do
+      expect(client.server_version).to match(/\A\d+\.\d+\.\d+\z/)
+    end
+
+    it "#execute runs DDL/DML without returning rows" do
+      client.execute("CREATE DATABASE IF NOT EXISTS chn_test")
+      client.execute("DROP TABLE IF EXISTS chn_test.x")
+      client.execute("CREATE TABLE chn_test.x (id UInt64, s String) ENGINE = Memory")
+      client.execute("INSERT INTO chn_test.x VALUES (1, 'a'), (2, 'b')")
+      expect(client.query_value("SELECT count() FROM chn_test.x")).to eq(2)
+      client.execute("DROP DATABASE chn_test")
+    end
+
+    it "#query_value returns the first cell" do
+      expect(client.query_value("SELECT 7 AS n")).to eq(7)
+      expect(client.query_value("SELECT 1 WHERE 0")).to be_nil
+    end
+
+    it "#describe_table returns [{name:, type:, ...}]" do
+      cols = client.describe_table("one", db_name: "system")
+      expect(cols).to be_a(Array)
+      expect(cols.first).to include(:name, :type)
+      expect(cols.map { |c| c[:name] }).to include("dummy")
+    end
+
+    it "reuses the same connection across many calls" do
+      threads = 30
+      threads.times { expect(client.query_value("SELECT 1")).to eq(1) }
+    end
+
+    it "#close releases the connection and subsequent calls raise" do
+      client.close
+      expect { client.query("SELECT 1") }.to raise_error(ClickhouseNative::ConnectionError, /closed/)
+    end
+  end
+
+  describe ClickhouseNative::Pool, :clickhouse do
+    let(:pool) { described_class.new(host: CH_HOST, port: CH_PORT, pool_size: 4) }
+
+    it "exposes the Client API" do
+      expect(pool.query_value("SELECT 1")).to eq(1)
+      expect(pool.ping).to be(true)
+    end
+
+    it "serves concurrent queries across its checked-out clients" do
+      results = Array.new(8).map do
+        Thread.new { pool.query_value("SELECT 1") }
+      end.map(&:value)
+      expect(results).to all(eq(1))
     end
   end
 end

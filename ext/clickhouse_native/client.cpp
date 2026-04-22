@@ -1,4 +1,5 @@
 #include <ruby.h>
+#include <ruby/thread.h>
 
 #include <clickhouse/client.h>
 #include <clickhouse/columns/array.h>
@@ -10,16 +11,61 @@
 #include <clickhouse/columns/nullable.h>
 #include <clickhouse/columns/string.h>
 #include <clickhouse/columns/tuple.h>
+#include <clickhouse/exceptions.h>
 #include <clickhouse/types/types.h>
 
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <string>
+#include <system_error>
 #include <vector>
 
 using namespace clickhouse;
 
 static VALUE rb_mClickhouseNative;
+static VALUE rb_cClient;
+
+static VALUE err_base, err_connection, err_timeout, err_protocol,
+             err_server, err_encoder, err_decoder, err_unsupported;
+
+// ------------------------------------------------------------------
+// Error mapping
+// ------------------------------------------------------------------
+
+static void raise_mapped_ex(const std::exception& e) {
+    if (auto* se = dynamic_cast<const ServerException*>(&e)) {
+        const auto& exc = se->GetException();
+        VALUE err = rb_exc_new_cstr(err_server, exc.display_text.c_str());
+        rb_ivar_set(err, rb_intern("@server_code"), INT2NUM(exc.code));
+        rb_ivar_set(err, rb_intern("@server_name"),
+                    rb_utf8_str_new(exc.name.data(), exc.name.size()));
+        rb_ivar_set(err, rb_intern("@server_stacktrace"),
+                    rb_utf8_str_new(exc.stack_trace.data(), exc.stack_trace.size()));
+        rb_exc_raise(err);
+    }
+    if (dynamic_cast<const ProtocolError*>(&e)) {
+        rb_raise(err_protocol, "%s", e.what());
+    }
+    if (dynamic_cast<const UnimplementedError*>(&e)) {
+        rb_raise(err_unsupported, "%s", e.what());
+    }
+    if (dynamic_cast<const ValidationError*>(&e)) {
+        rb_raise(err_decoder, "%s", e.what());
+    }
+    if (auto* se = dynamic_cast<const std::system_error*>(&e)) {
+        auto code = se->code();
+        if (code == std::errc::timed_out || code == std::errc::connection_aborted) {
+            rb_raise(err_timeout, "%s", e.what());
+        }
+        rb_raise(err_connection, "%s", e.what());
+    }
+    rb_raise(err_base, "%s", e.what());
+}
+
+// ------------------------------------------------------------------
+// Type codec (value decoder)
+// ------------------------------------------------------------------
 
 static int64_t pow10_i64(size_t n) {
     int64_t r = 1;
@@ -69,7 +115,6 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
             int64_t denom = pow10_i64(prec);
             int64_t secs = ticks / denom;
             int64_t frac = ticks % denom;
-            // Ruby Time holds microsecond precision. Scale to usec, truncating sub-μs.
             int64_t usec = (prec <= 6) ? frac * pow10_i64(6 - prec)
                                        : frac / pow10_i64(prec - 6);
             return rb_time_new(secs, usec);
@@ -80,9 +125,7 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
             auto inner = arr->GetAsColumn(idx);
             size_t sz = inner->Size();
             VALUE ary = rb_ary_new_capa(sz);
-            for (size_t i = 0; i < sz; i++) {
-                rb_ary_push(ary, value_at(inner, i));
-            }
+            for (size_t i = 0; i < sz; i++) rb_ary_push(ary, value_at(inner, i));
             return ary;
         }
 
@@ -94,8 +137,7 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
 
         case Type::LowCardinality: {
             auto lc = col->As<ColumnLowCardinality>();
-            ItemView item = lc->GetItem(idx);
-            auto sv = item.AsBinaryData();
+            auto sv = lc->GetItem(idx).AsBinaryData();
             return rb_utf8_str_new(sv.data(), sv.size());
         }
 
@@ -104,7 +146,7 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
             auto tuples = map_col->GetAsColumn(idx);
             auto tuple = tuples->As<ColumnTuple>();
             if (!tuple || tuple->TupleSize() != 2) {
-                rb_raise(rb_eRuntimeError, "clickhouse-native: malformed Map column");
+                rb_raise(err_decoder, "clickhouse-native: malformed Map column");
             }
             auto keys = (*tuple)[0];
             auto vals = (*tuple)[1];
@@ -120,9 +162,7 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
             auto t = col->As<ColumnTuple>();
             size_t sz = t->TupleSize();
             VALUE ary = rb_ary_new_capa(sz);
-            for (size_t i = 0; i < sz; i++) {
-                rb_ary_push(ary, value_at((*t)[i], idx));
-            }
+            for (size_t i = 0; i < sz; i++) rb_ary_push(ary, value_at((*t)[i], idx));
             return ary;
         }
 
@@ -136,59 +176,149 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
         }
 
         default:
-            rb_raise(rb_eRuntimeError,
+            rb_raise(err_unsupported,
                      "clickhouse-native: unsupported column type %s (code=%d)",
                      type->GetName().c_str(), static_cast<int>(type->GetCode()));
-    }
-    return Qnil;  // unreachable
-}
-
-static std::string rb_host_or_default(VALUE v) {
-    return NIL_P(v) ? std::string("localhost") : std::string(StringValueCStr(v));
-}
-
-static uint16_t rb_port_or_default(VALUE v) {
-    return NIL_P(v) ? 9000 : static_cast<uint16_t>(NUM2UINT(v));
-}
-
-// ClickhouseNative.hello(host="localhost", port=9000) -> 42
-static VALUE ch_hello(int argc, VALUE* argv, VALUE /*self*/) {
-    VALUE rb_host = Qnil, rb_port = Qnil;
-    rb_scan_args(argc, argv, "02", &rb_host, &rb_port);
-    std::string host = rb_host_or_default(rb_host);
-    uint16_t port = rb_port_or_default(rb_port);
-
-    try {
-        Client client(ClientOptions().SetHost(host).SetPort(port));
-        uint64_t result = 0;
-        bool saw_row = false;
-        client.Select("SELECT toUInt64(42)", [&](const Block& block) {
-            if (block.GetRowCount() == 0) return;
-            auto col = block[0]->As<ColumnUInt64>();
-            if (col && col->Size() > 0) { result = col->At(0); saw_row = true; }
-        });
-        if (!saw_row) rb_raise(rb_eRuntimeError, "clickhouse-native: no rows");
-        return ULL2NUM(result);
-    } catch (const std::exception& e) {
-        rb_raise(rb_eRuntimeError, "clickhouse-native: %s", e.what());
     }
     return Qnil;
 }
 
-// ClickhouseNative.query(sql, host="localhost", port=9000) -> Array<Hash{Symbol => typed}>
-static VALUE ch_query(int argc, VALUE* argv, VALUE /*self*/) {
-    VALUE rb_sql, rb_host = Qnil, rb_port = Qnil;
-    rb_scan_args(argc, argv, "12", &rb_sql, &rb_host, &rb_port);
-    Check_Type(rb_sql, T_STRING);
-    std::string sql = StringValueCStr(rb_sql);
-    std::string host = rb_host_or_default(rb_host);
-    uint16_t port = rb_port_or_default(rb_port);
+// ------------------------------------------------------------------
+// Client (TypedData-wrapped Client*)
+// ------------------------------------------------------------------
 
+struct CHClient {
+    std::unique_ptr<Client> client;
+};
+
+static void ch_client_free(void* p) {
+    delete static_cast<CHClient*>(p);
+}
+
+static size_t ch_client_size(const void* /*p*/) {
+    return sizeof(CHClient);
+}
+
+static const rb_data_type_t ch_client_data_type = {
+    "ClickhouseNative::Client",
+    { NULL, ch_client_free, ch_client_size, },
+    NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+static CHClient* as_client(VALUE self) {
+    CHClient* c;
+    TypedData_Get_Struct(self, CHClient, &ch_client_data_type, c);
+    return c;
+}
+
+static VALUE ch_client_alloc(VALUE klass) {
+    auto* c = new CHClient;
+    return TypedData_Wrap_Struct(klass, &ch_client_data_type, c);
+}
+
+static std::string kwarg_str(VALUE kwargs, const char* key, const char* fallback) {
+    ID id = rb_intern(key);
+    VALUE v = rb_hash_lookup2(kwargs, ID2SYM(id), Qundef);
+    if (v == Qundef || NIL_P(v)) return std::string(fallback);
+    return std::string(StringValueCStr(v));
+}
+
+static uint16_t kwarg_uint16(VALUE kwargs, const char* key, uint16_t fallback) {
+    ID id = rb_intern(key);
+    VALUE v = rb_hash_lookup2(kwargs, ID2SYM(id), Qundef);
+    if (v == Qundef || NIL_P(v)) return fallback;
+    return static_cast<uint16_t>(NUM2UINT(v));
+}
+
+// Client.new(host:, port:, database:, user:, password:)
+static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
+    VALUE kwargs = Qnil;
+    rb_scan_args(argc, argv, "0:", &kwargs);
+    if (NIL_P(kwargs)) kwargs = rb_hash_new();
+
+    std::string host = kwarg_str(kwargs, "host", "localhost");
+    uint16_t port = kwarg_uint16(kwargs, "port", 9000);
+    std::string database = kwarg_str(kwargs, "database", "default");
+    std::string user = kwarg_str(kwargs, "user", "default");
+    std::string password = kwarg_str(kwargs, "password", "");
+
+    CHClient* c = as_client(self);
     try {
-        Client client(ClientOptions().SetHost(host).SetPort(port));
-        VALUE rows = rb_ary_new();
+        ClientOptions opts;
+        opts.SetHost(host).SetPort(port)
+            .SetDefaultDatabase(database).SetUser(user).SetPassword(password);
+        c->client = std::make_unique<Client>(opts);
+    } catch (const std::exception& e) {
+        raise_mapped_ex(e);
+    }
+
+    rb_ivar_set(self, rb_intern("@host"), rb_utf8_str_new(host.data(), host.size()));
+    rb_ivar_set(self, rb_intern("@port"), UINT2NUM(port));
+    rb_ivar_set(self, rb_intern("@database"), rb_utf8_str_new(database.data(), database.size()));
+    return self;
+}
+
+// ------------------------------------------------------------------
+// GVL-released execute()
+// ------------------------------------------------------------------
+
+namespace {
+struct ExecuteNoGVL {
+    Client* client;
+    std::string sql;
+    std::exception_ptr err;
+};
+}  // namespace
+
+static void* execute_no_gvl(void* data) {
+    auto* a = static_cast<ExecuteNoGVL*>(data);
+    try {
+        a->client->Execute(Query(a->sql));
+    } catch (...) {
+        a->err = std::current_exception();
+    }
+    return nullptr;
+}
+
+static void execute_unblock(void* data) {
+    // The only safe abort clickhouse-cpp exposes is tearing the connection.
+    // On interrupt we kill the socket; the pool will discard this client.
+    auto* a = static_cast<ExecuteNoGVL*>(data);
+    try { a->client->ResetConnection(); } catch (...) {}
+}
+
+static VALUE ch_client_execute(VALUE self, VALUE rb_sql) {
+    Check_Type(rb_sql, T_STRING);
+    CHClient* c = as_client(self);
+    if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
+
+    ExecuteNoGVL args{c->client.get(), std::string(StringValueCStr(rb_sql)), nullptr};
+    rb_thread_call_without_gvl(execute_no_gvl, &args, execute_unblock, &args);
+    if (args.err) {
+        // clickhouse-cpp may leave the read stream partially consumed when the
+        // server exception or an unsupported-type error is thrown mid-block.
+        // Reset so the next call on this Client starts from a clean protocol.
+        try { c->client->ResetConnection(); } catch (...) {}
+        try { std::rethrow_exception(args.err); }
+        catch (const std::exception& e) { raise_mapped_ex(e); }
+    }
+    return Qnil;
+}
+
+// ------------------------------------------------------------------
+// query() — synchronous, GVL held (streaming query_each comes in Week 5)
+// ------------------------------------------------------------------
+
+static VALUE ch_client_query(VALUE self, VALUE rb_sql) {
+    Check_Type(rb_sql, T_STRING);
+    CHClient* c = as_client(self);
+    if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
+
+    std::string sql(StringValueCStr(rb_sql));
+    VALUE rows = rb_ary_new();
+    try {
         std::vector<ID> col_ids;
-        client.Select(sql, [&](const Block& block) {
+        c->client->Select(sql, [&](const Block& block) {
             size_t ncols = block.GetColumnCount();
             size_t nrows = block.GetRowCount();
             if (nrows == 0) return;
@@ -201,23 +331,177 @@ static VALUE ch_query(int argc, VALUE* argv, VALUE /*self*/) {
             }
             for (size_t r = 0; r < nrows; r++) {
                 VALUE h = rb_hash_new();
-                for (size_t c = 0; c < ncols; c++) {
-                    rb_hash_aset(h, ID2SYM(col_ids[c]), value_at(block[c], r));
+                for (size_t cc = 0; cc < ncols; cc++) {
+                    rb_hash_aset(h, ID2SYM(col_ids[cc]), value_at(block[cc], r));
                 }
                 rb_ary_push(rows, h);
             }
         });
         return rows;
     } catch (const std::exception& e) {
-        rb_raise(rb_eRuntimeError, "clickhouse-native: %s", e.what());
+        try { c->client->ResetConnection(); } catch (...) {}
+        raise_mapped_ex(e);
     }
     return Qnil;
 }
 
+// ------------------------------------------------------------------
+// query_value — returns the first cell of the first row, or nil
+// ------------------------------------------------------------------
+
+static VALUE ch_client_query_value(VALUE self, VALUE rb_sql) {
+    Check_Type(rb_sql, T_STRING);
+    CHClient* c = as_client(self);
+    if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
+
+    std::string sql(StringValueCStr(rb_sql));
+    try {
+        VALUE out = Qnil;
+        bool seen = false;
+        c->client->Select(sql, [&](const Block& block) {
+            if (seen) return;
+            if (block.GetRowCount() == 0 || block.GetColumnCount() == 0) return;
+            out = value_at(block[0], 0);
+            seen = true;
+        });
+        return out;
+    } catch (const std::exception& e) {
+        try { c->client->ResetConnection(); } catch (...) {}
+        raise_mapped_ex(e);
+    }
+    return Qnil;
+}
+
+// ------------------------------------------------------------------
+// ping / server_version / reset_connection / close
+// ------------------------------------------------------------------
+
+namespace {
+struct PingNoGVL {
+    Client* client;
+    std::exception_ptr err;
+};
+}  // namespace
+
+static void* ping_no_gvl(void* data) {
+    auto* a = static_cast<PingNoGVL*>(data);
+    try { a->client->Ping(); } catch (...) { a->err = std::current_exception(); }
+    return nullptr;
+}
+
+static VALUE ch_client_ping(VALUE self) {
+    CHClient* c = as_client(self);
+    if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
+    PingNoGVL args{c->client.get(), nullptr};
+    rb_thread_call_without_gvl(ping_no_gvl, &args, nullptr, nullptr);
+    if (args.err) {
+        try { std::rethrow_exception(args.err); }
+        catch (const std::exception& e) { raise_mapped_ex(e); }
+    }
+    return Qtrue;
+}
+
+static VALUE ch_client_server_version(VALUE self) {
+    CHClient* c = as_client(self);
+    if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
+    try {
+        const ServerInfo& info = c->client->GetServerInfo();
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "%llu.%llu.%llu",
+                         static_cast<unsigned long long>(info.version_major),
+                         static_cast<unsigned long long>(info.version_minor),
+                         static_cast<unsigned long long>(info.version_patch));
+        return rb_utf8_str_new(buf, n);
+    } catch (const std::exception& e) {
+        raise_mapped_ex(e);
+    }
+    return Qnil;
+}
+
+static VALUE ch_client_reset_connection(VALUE self) {
+    CHClient* c = as_client(self);
+    if (!c->client) return Qnil;
+    try { c->client->ResetConnection(); } catch (...) {}
+    return Qtrue;
+}
+
+static VALUE ch_client_close(VALUE self) {
+    CHClient* c = as_client(self);
+    c->client.reset();
+    return Qnil;
+}
+
+// ------------------------------------------------------------------
+// Backward-compat: ClickhouseNative.hello(host, port) — Spike 1 smoke test
+// ------------------------------------------------------------------
+
+static VALUE ch_hello(int argc, VALUE* argv, VALUE /*self*/) {
+    VALUE rb_host = Qnil, rb_port = Qnil;
+    rb_scan_args(argc, argv, "02", &rb_host, &rb_port);
+    std::string host = NIL_P(rb_host) ? "localhost" : StringValueCStr(rb_host);
+    uint16_t port = NIL_P(rb_port) ? 9000 : static_cast<uint16_t>(NUM2UINT(rb_port));
+
+    try {
+        Client client(ClientOptions().SetHost(host).SetPort(port));
+        uint64_t result = 0;
+        bool saw_row = false;
+        client.Select("SELECT toUInt64(42)", [&](const Block& block) {
+            if (block.GetRowCount() == 0) return;
+            auto col = block[0]->As<ColumnUInt64>();
+            if (col && col->Size() > 0) { result = col->At(0); saw_row = true; }
+        });
+        if (!saw_row) rb_raise(err_base, "clickhouse-native: no rows");
+        return ULL2NUM(result);
+    } catch (const std::exception& e) {
+        raise_mapped_ex(e);
+    }
+    return Qnil;
+}
+
+// ------------------------------------------------------------------
+// Init
+// ------------------------------------------------------------------
+
 extern "C" void Init_clickhouse_native(void) {
     rb_mClickhouseNative = rb_define_module("ClickhouseNative");
+
+    err_base        = rb_const_get(rb_mClickhouseNative, rb_intern("Error"));
+    err_connection  = rb_const_get(rb_mClickhouseNative, rb_intern("ConnectionError"));
+    err_timeout     = rb_const_get(rb_mClickhouseNative, rb_intern("TimeoutError"));
+    err_protocol    = rb_const_get(rb_mClickhouseNative, rb_intern("ProtocolError"));
+    err_server      = rb_const_get(rb_mClickhouseNative, rb_intern("ServerError"));
+    err_encoder     = rb_const_get(rb_mClickhouseNative, rb_intern("EncoderError"));
+    err_decoder     = rb_const_get(rb_mClickhouseNative, rb_intern("DecoderError"));
+    err_unsupported = rb_const_get(rb_mClickhouseNative, rb_intern("UnsupportedTypeError"));
+    rb_global_variable(&err_base);
+    rb_global_variable(&err_connection);
+    rb_global_variable(&err_timeout);
+    rb_global_variable(&err_protocol);
+    rb_global_variable(&err_server);
+    rb_global_variable(&err_encoder);
+    rb_global_variable(&err_decoder);
+    rb_global_variable(&err_unsupported);
+
+    rb_cClient = rb_define_class_under(rb_mClickhouseNative, "Client", rb_cObject);
+    rb_global_variable(&rb_cClient);
+    rb_define_alloc_func(rb_cClient, ch_client_alloc);
+    rb_define_method(rb_cClient, "initialize",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_initialize), -1);
+    rb_define_method(rb_cClient, "execute",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_execute), 1);
+    rb_define_method(rb_cClient, "query",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query), 1);
+    rb_define_method(rb_cClient, "query_value",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query_value), 1);
+    rb_define_method(rb_cClient, "ping",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_ping), 0);
+    rb_define_method(rb_cClient, "server_version",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_server_version), 0);
+    rb_define_method(rb_cClient, "reset_connection",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_reset_connection), 0);
+    rb_define_method(rb_cClient, "close",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_close), 0);
+
     rb_define_singleton_method(rb_mClickhouseNative, "hello",
         reinterpret_cast<VALUE (*)(ANYARGS)>(ch_hello), -1);
-    rb_define_singleton_method(rb_mClickhouseNative, "query",
-        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_query), -1);
 }
