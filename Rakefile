@@ -16,9 +16,10 @@ CROSS_PLATFORMS = %w[
   arm64-darwin
 ].freeze
 
-# Ruby ABIs to build pre-compiled gems for. rake-compiler-dock's image
-# ships these Ruby versions pre-installed.
-CROSS_RUBIES = %w[3.1.4 3.2.3 3.3.0 3.4.0].freeze
+# Ruby ABIs to build pre-compiled gems for. Patch versions must match
+# what rake-compiler-dock ships pre-installed (see
+# /usr/local/rake-compiler/ruby/<platform> inside the image).
+CROSS_RUBIES = %w[3.3.11 3.4.9 4.0.2].freeze
 
 Rake::ExtensionTask.new("clickhouse_native", GEMSPEC) do |ext|
   ext.lib_dir = "lib/clickhouse_native"
@@ -51,7 +52,8 @@ namespace :gem do
       task platform do
         RakeCompilerDock.sh(
           <<~SH,
-            bundle --local --without development benchmark
+            export BUNDLE_GEMFILE=$(pwd)/Gemfile.release
+            bundle install
             bundle exec rake native:#{platform} gem RUBY_CC_VERSION=#{CROSS_RUBIES.join(':')}
           SH
           platform: platform,

@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
   spec.description = "A high-performance Ruby client for ClickHouse using the " \
                      "native binary protocol via a C++ extension wrapping clickhouse-cpp."
   spec.license = "Apache-2.0"
-  spec.required_ruby_version = ">= 3.1.0"
+  spec.required_ruby_version = ">= 3.3.0"
 
   spec.files = Dir.glob("{lib,ext}/**/*", File::FNM_DOTMATCH).reject do |path|
     File.directory?(path) || path.include?("/build/") || path.match?(%r{/vendor/clickhouse-cpp/(?:\.git|bench|tests|ut)/})
@@ -18,7 +18,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.extensions = ["ext/clickhouse_native/extconf.rb"]
 
-  spec.add_dependency "connection_pool", "~> 2.4"
+  spec.add_dependency "connection_pool", ">= 2.4"
 
   spec.add_development_dependency "rake", "~> 13.2"
   spec.add_development_dependency "rake-compiler", "~> 1.2"

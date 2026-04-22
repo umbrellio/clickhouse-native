@@ -5,7 +5,11 @@ require "shellwords"
 
 EXT_DIR = __dir__
 VENDOR = File.expand_path("vendor/clickhouse-cpp", EXT_DIR)
-BUILD_DIR = File.expand_path("build", EXT_DIR)
+# Scope the cmake build dir by target arch so host and cross-compile
+# builds don't share a CMakeCache.txt (which burns in absolute paths
+# like the host cmake binary).
+ARCH = RbConfig::CONFIG["arch"] || "unknown"
+BUILD_DIR = File.expand_path("../../tmp/cpp-build-#{ARCH}", EXT_DIR)
 
 def fatal(msg)
   warn
@@ -46,6 +50,7 @@ unless find_executable("cmake")
 end
 
 cxx = ENV["CXX"] || RbConfig::CONFIG["CXX"] || "c++"
+cc = ENV["CC"] || RbConfig::CONFIG["CC"] || "cc"
 unless find_executable(cxx.split.first)
   fatal <<~MSG
     A C++17-capable compiler is required.
@@ -64,6 +69,8 @@ unless File.exist?(File.join(BUILD_DIR, "CMakeCache.txt"))
     "cmake",
     "-S", VENDOR,
     "-B", BUILD_DIR,
+    "-DCMAKE_C_COMPILER=#{cc.split.first}",
+    "-DCMAKE_CXX_COMPILER=#{cxx.split.first}",
     "-DBUILD_SHARED_LIBS=OFF",
     "-DBUILD_BENCHMARK=OFF",
     "-DBUILD_TESTS=OFF",

@@ -12,4 +12,5 @@ tmp/
 pkg/
 .bundle/
 Gemfile.lock
+Gemfile.release.lock
 .rake_compiler_dock/
