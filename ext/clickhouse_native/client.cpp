@@ -308,12 +308,40 @@ static void append_default(const ColumnRef& col) {
     }
 }
 
+// Detect a trailing timezone indicator: "Z", "+HHMM", "+HH:MM", or the
+// same with '-' (anywhere after the date portion, so the '-' inside
+// "YYYY-MM-DD" doesn't match). Used to decide whether a naked timestamp
+// string should be forced to UTC.
+static bool has_trailing_tz(const char* s, size_t len) {
+    if (len == 0) return false;
+    if (s[len - 1] == 'Z' || s[len - 1] == 'z') return true;
+    // walk backwards for a '+' or '-' within the last 6 chars (HH:MM / HHMM)
+    size_t limit = len > 6 ? len - 6 : 0;
+    for (size_t i = len; i-- > limit; ) {
+        if (i < 11) break;  // position must be past "YYYY-MM-DD "
+        if (s[i] == '+' || s[i] == '-') return true;
+    }
+    return false;
+}
+
 // Accepts a Time, a String (parsed via Time.parse), or a numeric (epoch
 // seconds). Mirrors how the HTTP gem's JSONEachRow coerced date cells.
+//
+// Naked timestamp strings (no trailing TZ indicator) are parsed as UTC —
+// CH's DateTime64(N, 'UTC') convention. Strings with explicit zones are
+// respected.
 static VALUE coerce_to_time(VALUE value) {
     if (rb_obj_is_kind_of(value, rb_cTime)) return value;
     if (RB_TYPE_P(value, T_STRING)) {
-        return rb_funcall(rb_cTime, rb_intern("parse"), 1, value);
+        const char* p = RSTRING_PTR(value);
+        long n = RSTRING_LEN(value);
+        VALUE to_parse = value;
+        if (!has_trailing_tz(p, n)) {
+            std::string with_utc(p, n);
+            with_utc.append(" UTC");
+            to_parse = rb_utf8_str_new(with_utc.data(), with_utc.size());
+        }
+        return rb_funcall(rb_cTime, rb_intern("parse"), 1, to_parse);
     }
     if (RB_INTEGER_TYPE_P(value) || RB_FLOAT_TYPE_P(value)) {
         return rb_funcall(rb_cTime, rb_intern("at"), 1, value);
@@ -435,11 +463,17 @@ static void append_value(const ColumnRef& col, VALUE value) {
         case Type::Decimal32:
         case Type::Decimal64:
         case Type::Decimal128: {
-            // Feed the value as a decimal string; clickhouse-cpp's
-            // ColumnDecimal::Append(string) handles the scaling.
-            VALUE str = rb_funcall(value, rb_intern("to_s"), 0);
-            StringValue(str);
-            col->As<ColumnDecimal>()->Append(std::string(RSTRING_PTR(str), RSTRING_LEN(str)));
+            // clickhouse-cpp's Decimal::Append(string) only scales up when a
+            // decimal point is present (see columns/decimal.cpp). "1" at
+            // scale 8 is parsed as unscaled 1 => 1e-8, not 1. Normalise
+            // through BigDecimal#to_s("F") so Integer / Float / BigDecimal
+            // all land as a fixed-point string.
+            VALUE bd = rb_funcall(rb_cObject, rb_intern("BigDecimal"), 1,
+                                  rb_funcall(value, rb_intern("to_s"), 0));
+            VALUE str = rb_funcall(bd, rb_intern("to_s"), 1,
+                                   rb_utf8_str_new_cstr("F"));
+            col->As<ColumnDecimal>()->Append(
+                std::string(RSTRING_PTR(str), RSTRING_LEN(str)));
             return;
         }
 

@@ -13,6 +13,9 @@ module ClickhouseNative
     # columns defaults to the first hash's keys (for Array<Hash>) or all table
     # columns in DDL order (for Array<Array>).
     # types may be supplied to skip the DESCRIBE lookup.
+    #
+    # Hash keys not present in the schema raise ArgumentError — if you need
+    # to insert a subset, pass `columns:` explicitly.
     def insert(table, rows, columns: nil, db_name: nil, types: nil)
       return 0 if rows.empty?
       fq = db_name ? "#{db_name}.#{table}" : table
