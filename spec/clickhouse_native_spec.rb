@@ -160,6 +160,95 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
     end
   end
 
+  describe "#insert" do
+    before do
+      client.execute("CREATE DATABASE IF NOT EXISTS chn_ins_test")
+      client.execute("DROP TABLE IF EXISTS chn_ins_test.t")
+      client.execute(<<~SQL)
+        CREATE TABLE chn_ins_test.t (
+          id UInt64,
+          name String,
+          score Nullable(Float64),
+          tags Array(String),
+          created DateTime64(6, 'UTC')
+        ) ENGINE = Memory
+      SQL
+    end
+    after { client.execute("DROP DATABASE chn_ins_test") }
+
+    let(:t) { Time.utc(2026, 4, 22, 10, 30, 0, 123_456) }
+
+    it "inserts an Array<Hash>, round-trips via SELECT" do
+      client.insert("t", [
+        {id: 1, name: "a", score: 1.5, tags: ["x"],         created: t},
+        {id: 2, name: "b", score: nil, tags: ["y", "z"],    created: t},
+      ], db_name: "chn_ins_test")
+
+      rows = client.query("SELECT id, name, score, tags, created FROM chn_ins_test.t ORDER BY id")
+      expect(rows.size).to eq(2)
+      expect(rows[0]).to include(id: 1, name: "a", score: 1.5, tags: ["x"])
+      expect(rows[0][:created].usec).to eq(123_456)
+      expect(rows[1]).to include(id: 2, name: "b", score: nil, tags: ["y", "z"])
+    end
+
+    it "inserts Array<Array> with explicit columns in table order" do
+      client.insert("t",
+        [[10, "c", nil, [], t]],
+        db_name: "chn_ins_test")
+      expect(client.query_value("SELECT name FROM chn_ins_test.t WHERE id = 10")).to eq("c")
+    end
+
+    it "is a no-op on an empty rows array" do
+      expect(client.insert("t", [], db_name: "chn_ins_test")).to eq(0)
+      expect(client.query_value("SELECT count() FROM chn_ins_test.t")).to eq(0)
+    end
+
+    it "surfaces EncoderError when a column type is unsupported for insert" do
+      client.execute("CREATE TABLE chn_ins_test.u (m Map(String, Int32)) ENGINE = Memory")
+      expect {
+        client.insert("u", [{m: {"a" => 1}}], db_name: "chn_ins_test")
+      }.to raise_error(ClickhouseNative::EncoderError, /Map/)
+    end
+  end
+
+  describe "#query_each" do
+    it "yields each row to the block" do
+      rows = []
+      client.query_each("SELECT number AS n FROM numbers(5)") { |row| rows << row }
+      expect(rows).to eq([{n: 0}, {n: 1}, {n: 2}, {n: 3}, {n: 4}])
+    end
+
+    it "streams large result sets without materialising an array" do
+      count = 0
+      client.query_each("SELECT number FROM numbers(10000)") { |_| count += 1 }
+      expect(count).to eq(10_000)
+    end
+
+    it "propagates an exception raised inside the block and keeps the client usable" do
+      expect {
+        client.query_each("SELECT number FROM numbers(100)") do |row|
+          raise "boom" if row[:number] == 3
+        end
+      }.to raise_error("boom")
+      # Connection was auto-reset; the client still works.
+      expect(client.query_value("SELECT 1")).to eq(1)
+    end
+
+    it "supports early termination via a Ruby raise" do
+      first = nil
+      begin
+        client.query_each("SELECT number FROM numbers(1000000)") do |row|
+          first ||= row[:number]
+          throw :done
+        end
+      rescue UncaughtThrowError
+        # expected
+      end
+      expect(first).to eq(0)
+      expect(client.query_value("SELECT 2")).to eq(2)
+    end
+  end
+
   describe "error mapping" do
     it "raises ServerError with code/name/message on server-side failures" do
       expect { client.query("SELECT no_such_function()") }.to raise_error do |err|

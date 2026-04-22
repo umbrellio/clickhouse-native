@@ -22,8 +22,16 @@ module ClickhouseNative
       @pool.with { |c| c.query(sql) }
     end
 
+    def query_each(sql, &block)
+      @pool.with { |c| c.query_each(sql, &block) }
+    end
+
     def query_value(sql)
       @pool.with { |c| c.query_value(sql) }
+    end
+
+    def insert(table, rows, **opts)
+      @pool.with { |c| c.insert(table, rows, **opts) }
     end
 
     def ping

@@ -65,3 +65,38 @@ end
 bench_pair("tiny", TINY_SQL)
 bench_pair("medium(1k rows)", MEDIUM_SQL)
 bench_pair("large(100k rows)", LARGE_SQL)
+
+# ------------------------------------------------------------------
+# Insert: native block insert vs HTTP JSONEachRow
+# ------------------------------------------------------------------
+
+CHN.execute("CREATE DATABASE IF NOT EXISTS chn_bench")
+CHN.execute("DROP TABLE IF EXISTS chn_bench.t")
+CHN.execute(<<~SQL)
+  CREATE TABLE chn_bench.t (
+    id UInt64, s String, f Float64, t DateTime64(6, 'UTC')
+  ) ENGINE = Memory
+SQL
+
+ROWS_1K = Array.new(1000) do |i|
+  {id: i, s: "row-#{i}", f: i / 3.14, t: Time.utc(2026, 4, 22, 10, 0, 0, 123_456)}
+end
+
+puts "insert(1k rows): warming up..."
+CHN.insert("t", ROWS_1K, db_name: "chn_bench")
+CHN.execute("TRUNCATE TABLE chn_bench.t")
+
+Benchmark.ips do |x|
+  x.warmup = 1
+  x.time = 3
+  x.report("native:insert(1k)") do
+    CHN.insert("t", ROWS_1K, db_name: "chn_bench")
+    CHN.execute("TRUNCATE TABLE chn_bench.t")
+  end
+  x.report("http:insert(1k)") do
+    CH_HTTP.insert("chn_bench.t", ROWS_1K.map { |r| r.merge(t: r[:t].strftime("%Y-%m-%d %H:%M:%S.%6N")) })
+    CH_HTTP.execute("TRUNCATE TABLE chn_bench.t")
+  end
+  x.compare!
+end
+CHN.execute("DROP DATABASE chn_bench")

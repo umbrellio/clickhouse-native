@@ -5,6 +5,7 @@
 #include <clickhouse/columns/array.h>
 #include <clickhouse/columns/date.h>
 #include <clickhouse/columns/enum.h>
+#include <clickhouse/columns/factory.h>
 #include <clickhouse/columns/lowcardinality.h>
 #include <clickhouse/columns/map.h>
 #include <clickhouse/columns/numeric.h>
@@ -29,6 +30,14 @@ static VALUE rb_cClient;
 static VALUE err_base, err_connection, err_timeout, err_protocol,
              err_server, err_encoder, err_decoder, err_unsupported;
 
+// Internal exception used to tag encoder failures and drive them through
+// raise_mapped_ex -> err_encoder without rb_raising from inside a try block.
+namespace chn {
+class EncoderFailure : public clickhouse::Error {
+    using clickhouse::Error::Error;
+};
+}  // namespace chn
+
 // ------------------------------------------------------------------
 // Error mapping
 // ------------------------------------------------------------------
@@ -43,6 +52,9 @@ static void raise_mapped_ex(const std::exception& e) {
         rb_ivar_set(err, rb_intern("@server_stacktrace"),
                     rb_utf8_str_new(exc.stack_trace.data(), exc.stack_trace.size()));
         rb_exc_raise(err);
+    }
+    if (dynamic_cast<const chn::EncoderFailure*>(&e)) {
+        rb_raise(err_encoder, "%s", e.what());
     }
     if (dynamic_cast<const ProtocolError*>(&e)) {
         rb_raise(err_protocol, "%s", e.what());
@@ -181,6 +193,138 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
                      type->GetName().c_str(), static_cast<int>(type->GetCode()));
     }
     return Qnil;
+}
+
+// ------------------------------------------------------------------
+// Write codec (value encoder for inserts)
+// ------------------------------------------------------------------
+
+static void append_value(const ColumnRef& col, VALUE value);
+
+// Append a zero/default value; used for the nested column of Nullable when
+// the flag is set to null. We never expose these bytes to the caller.
+static void append_default(const ColumnRef& col) {
+    auto type = col->Type();
+    switch (type->GetCode()) {
+        case Type::Int8:    col->As<ColumnInt8>()->Append(0); return;
+        case Type::Int16:   col->As<ColumnInt16>()->Append(0); return;
+        case Type::Int32:   col->As<ColumnInt32>()->Append(0); return;
+        case Type::Int64:   col->As<ColumnInt64>()->Append(0); return;
+        case Type::UInt8:   col->As<ColumnUInt8>()->Append(0); return;
+        case Type::UInt16:  col->As<ColumnUInt16>()->Append(0); return;
+        case Type::UInt32:  col->As<ColumnUInt32>()->Append(0); return;
+        case Type::UInt64:  col->As<ColumnUInt64>()->Append(0); return;
+        case Type::Float32: col->As<ColumnFloat32>()->Append(0); return;
+        case Type::Float64: col->As<ColumnFloat64>()->Append(0); return;
+        case Type::String:      col->As<ColumnString>()->Append(std::string_view()); return;
+        case Type::FixedString: col->As<ColumnFixedString>()->Append(std::string_view()); return;
+        case Type::Date:        col->As<ColumnDate>()->Append(0); return;
+        case Type::Date32:      col->As<ColumnDate32>()->Append(0); return;
+        case Type::DateTime:    col->As<ColumnDateTime>()->Append(0); return;
+        case Type::DateTime64:  col->As<ColumnDateTime64>()->Append(0); return;
+        case Type::Array: {
+            auto inner_type = type->As<ArrayType>()->GetItemType();
+            auto inner_col = CreateColumnByType(inner_type->GetName());
+            col->As<ColumnArray>()->AppendAsColumn(inner_col);
+            return;
+        }
+        default:
+            throw chn::EncoderFailure(
+                "no default value for Nullable(" + type->GetName() + ")");
+    }
+}
+
+static int64_t time_to_datetime64_ticks(VALUE value, size_t prec) {
+    VALUE to_i = rb_funcall(value, rb_intern("to_i"), 0);
+    VALUE nsec = rb_funcall(value, rb_intern("nsec"), 0);
+    int64_t sec = NUM2LL(to_i);
+    int64_t ns = NUM2LL(nsec);
+    int64_t total_ns = sec * 1'000'000'000LL + ns;
+    if (prec <= 9) return total_ns / pow10_i64(9 - prec);
+    return total_ns * pow10_i64(prec - 9);
+}
+
+static void append_value(const ColumnRef& col, VALUE value) {
+    auto type = col->Type();
+    switch (type->GetCode()) {
+        case Type::Int8:    col->As<ColumnInt8>()->Append(NUM2INT(value)); return;
+        case Type::Int16:   col->As<ColumnInt16>()->Append(NUM2INT(value)); return;
+        case Type::Int32:   col->As<ColumnInt32>()->Append(NUM2INT(value)); return;
+        case Type::Int64:   col->As<ColumnInt64>()->Append(NUM2LL(value)); return;
+        case Type::UInt8:   col->As<ColumnUInt8>()->Append(NUM2UINT(value)); return;
+        case Type::UInt16:  col->As<ColumnUInt16>()->Append(NUM2UINT(value)); return;
+        case Type::UInt32:  col->As<ColumnUInt32>()->Append(NUM2UINT(value)); return;
+        case Type::UInt64:  col->As<ColumnUInt64>()->Append(NUM2ULL(value)); return;
+        case Type::Float32: col->As<ColumnFloat32>()->Append(static_cast<float>(NUM2DBL(value))); return;
+        case Type::Float64: col->As<ColumnFloat64>()->Append(NUM2DBL(value)); return;
+
+        case Type::String: {
+            StringValue(value);
+            col->As<ColumnString>()->Append(
+                std::string_view(RSTRING_PTR(value), RSTRING_LEN(value)));
+            return;
+        }
+        case Type::FixedString: {
+            StringValue(value);
+            col->As<ColumnFixedString>()->Append(
+                std::string_view(RSTRING_PTR(value), RSTRING_LEN(value)));
+            return;
+        }
+
+        case Type::Date: {
+            VALUE to_i = rb_funcall(value, rb_intern("to_i"), 0);
+            col->As<ColumnDate>()->Append(static_cast<std::time_t>(NUM2LL(to_i)));
+            return;
+        }
+        case Type::Date32: {
+            VALUE to_i = rb_funcall(value, rb_intern("to_i"), 0);
+            col->As<ColumnDate32>()->Append(static_cast<std::time_t>(NUM2LL(to_i)));
+            return;
+        }
+        case Type::DateTime: {
+            VALUE to_i = rb_funcall(value, rb_intern("to_i"), 0);
+            col->As<ColumnDateTime>()->Append(static_cast<std::time_t>(NUM2LL(to_i)));
+            return;
+        }
+        case Type::DateTime64: {
+            size_t prec = type->As<DateTime64Type>()->GetPrecision();
+            col->As<ColumnDateTime64>()->Append(time_to_datetime64_ticks(value, prec));
+            return;
+        }
+
+        case Type::Nullable: {
+            auto nul = col->As<ColumnNullable>();
+            auto nested = nul->Nested();
+            if (NIL_P(value)) {
+                nul->Append(true);
+                append_default(nested);
+            } else {
+                nul->Append(false);
+                append_value(nested, value);
+            }
+            return;
+        }
+
+        case Type::Array: {
+            Check_Type(value, T_ARRAY);
+            auto inner_type = type->As<ArrayType>()->GetItemType();
+            auto inner_col = CreateColumnByType(inner_type->GetName());
+            if (!inner_col) {
+                throw chn::EncoderFailure(
+                    "cannot create column for Array inner type " + inner_type->GetName());
+            }
+            long n = RARRAY_LEN(value);
+            for (long i = 0; i < n; i++) {
+                append_value(inner_col, rb_ary_entry(value, i));
+            }
+            col->As<ColumnArray>()->AppendAsColumn(inner_col);
+            return;
+        }
+
+        default:
+            throw chn::EncoderFailure(
+                "cannot insert into column of type " + type->GetName());
+    }
 }
 
 // ------------------------------------------------------------------
@@ -373,6 +517,212 @@ static VALUE ch_client_query_value(VALUE self, VALUE rb_sql) {
 }
 
 // ------------------------------------------------------------------
+// insert_block(table, [[name, type], ...], [[v, v, ...], ...])
+// ------------------------------------------------------------------
+
+namespace {
+struct InsertNoGVL {
+    Client* client;
+    const std::string* table;
+    const Block* block;
+    std::exception_ptr err;
+};
+}  // namespace
+
+static void* insert_no_gvl(void* data) {
+    auto* a = static_cast<InsertNoGVL*>(data);
+    try {
+        a->client->Insert(*a->table, *a->block);
+    } catch (...) {
+        a->err = std::current_exception();
+    }
+    return nullptr;
+}
+
+static void insert_unblock(void* data) {
+    auto* a = static_cast<InsertNoGVL*>(data);
+    try { a->client->ResetConnection(); } catch (...) {}
+}
+
+static VALUE ch_client_insert_block(VALUE self, VALUE rb_table, VALUE rb_columns, VALUE rb_rows) {
+    Check_Type(rb_table, T_STRING);
+    Check_Type(rb_columns, T_ARRAY);
+    Check_Type(rb_rows, T_ARRAY);
+    CHClient* c = as_client(self);
+    if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
+
+    long ncols = RARRAY_LEN(rb_columns);
+    long nrows = RARRAY_LEN(rb_rows);
+    if (ncols == 0) rb_raise(err_encoder, "clickhouse-native: insert requires at least one column");
+
+    try {
+        std::string table(RSTRING_PTR(rb_table), RSTRING_LEN(rb_table));
+        std::vector<std::string> names;
+        std::vector<ColumnRef> cols;
+        names.reserve(ncols);
+        cols.reserve(ncols);
+        for (long i = 0; i < ncols; i++) {
+            VALUE pair = rb_ary_entry(rb_columns, i);
+            Check_Type(pair, T_ARRAY);
+            VALUE rb_name = rb_ary_entry(pair, 0);
+            VALUE rb_type = rb_ary_entry(pair, 1);
+            StringValue(rb_name);
+            StringValue(rb_type);
+            names.emplace_back(RSTRING_PTR(rb_name), RSTRING_LEN(rb_name));
+            std::string type_str(RSTRING_PTR(rb_type), RSTRING_LEN(rb_type));
+            auto ch_col = CreateColumnByType(type_str);
+            if (!ch_col) {
+                throw chn::EncoderFailure("unknown column type " + type_str + " for " + names.back());
+            }
+            ch_col->Reserve(static_cast<size_t>(nrows));
+            cols.push_back(ch_col);
+        }
+
+        for (long r = 0; r < nrows; r++) {
+            VALUE row = rb_ary_entry(rb_rows, r);
+            Check_Type(row, T_ARRAY);
+            if (RARRAY_LEN(row) != ncols) {
+                char msg[96];
+                std::snprintf(msg, sizeof(msg),
+                    "row %ld has %ld values, expected %ld",
+                    r, static_cast<long>(RARRAY_LEN(row)), ncols);
+                throw chn::EncoderFailure(msg);
+            }
+            for (long cc = 0; cc < ncols; cc++) {
+                append_value(cols[cc], rb_ary_entry(row, cc));
+            }
+        }
+
+        Block block;
+        for (long i = 0; i < ncols; i++) {
+            block.AppendColumn(names[i], cols[i]);
+        }
+
+        InsertNoGVL args{c->client.get(), &table, &block, nullptr};
+        rb_thread_call_without_gvl(insert_no_gvl, &args, insert_unblock, &args);
+        if (args.err) {
+            try { c->client->ResetConnection(); } catch (...) {}
+            try { std::rethrow_exception(args.err); }
+            catch (const std::exception& e) { raise_mapped_ex(e); }
+        }
+    } catch (const std::exception& e) {
+        try { c->client->ResetConnection(); } catch (...) {}
+        raise_mapped_ex(e);
+    }
+    return LONG2NUM(nrows);
+}
+
+// ------------------------------------------------------------------
+// query_each(sql) { |row_hash| ... }
+// ------------------------------------------------------------------
+
+namespace {
+struct QueryEachState {
+    VALUE user_proc;
+    std::vector<ID> col_ids;
+    int exc_tag;
+    bool aborted;
+};
+
+struct YieldBlockArgs {
+    const Block* block;
+    QueryEachState* state;
+};
+
+struct QueryEachNoGVL {
+    Client* client;
+    std::string sql;
+    QueryEachState* state;
+    std::exception_ptr err;
+};
+}  // namespace
+
+static VALUE yield_rows_body(VALUE arg) {
+    auto* args = reinterpret_cast<YieldBlockArgs*>(arg);
+    const Block& block = *args->block;
+    auto* state = args->state;
+    size_t ncols = block.GetColumnCount();
+    size_t nrows = block.GetRowCount();
+    if (nrows == 0) return Qnil;
+    if (state->col_ids.empty() && ncols > 0) {
+        state->col_ids.reserve(ncols);
+        for (size_t i = 0; i < ncols; i++) {
+            const std::string& name = block.GetColumnName(i);
+            state->col_ids.push_back(rb_intern2(name.data(), name.size()));
+        }
+    }
+    for (size_t r = 0; r < nrows; r++) {
+        VALUE h = rb_hash_new();
+        for (size_t cc = 0; cc < ncols; cc++) {
+            rb_hash_aset(h, ID2SYM(state->col_ids[cc]), value_at(block[cc], r));
+        }
+        rb_funcall(state->user_proc, rb_intern("call"), 1, h);
+    }
+    return Qnil;
+}
+
+static void* with_gvl_yield(void* data) {
+    auto* args = static_cast<YieldBlockArgs*>(data);
+    int tag = 0;
+    rb_protect(yield_rows_body, reinterpret_cast<VALUE>(args), &tag);
+    if (tag != 0) {
+        args->state->exc_tag = tag;
+        args->state->aborted = true;
+    }
+    return nullptr;
+}
+
+static void* query_each_no_gvl(void* data) {
+    auto* a = static_cast<QueryEachNoGVL*>(data);
+    try {
+        a->client->SelectCancelable(a->sql, [&](const Block& block) -> bool {
+            if (a->state->aborted) return false;
+            YieldBlockArgs ya{&block, a->state};
+            rb_thread_call_with_gvl(with_gvl_yield, &ya);
+            return !a->state->aborted;
+        });
+    } catch (...) {
+        a->err = std::current_exception();
+    }
+    return nullptr;
+}
+
+static void query_each_unblock(void* data) {
+    auto* a = static_cast<QueryEachNoGVL*>(data);
+    a->state->aborted = true;
+    try { a->client->ResetConnection(); } catch (...) {}
+}
+
+static VALUE ch_client_query_each(VALUE self, VALUE rb_sql) {
+    rb_need_block();
+    Check_Type(rb_sql, T_STRING);
+    CHClient* c = as_client(self);
+    if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
+
+    QueryEachState state{rb_block_proc(), {}, 0, false};
+    QueryEachNoGVL args{
+        c->client.get(),
+        std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)),
+        &state,
+        nullptr,
+    };
+
+    rb_thread_call_without_gvl(query_each_no_gvl, &args, query_each_unblock, &args);
+
+    if (args.err) {
+        try { c->client->ResetConnection(); } catch (...) {}
+        if (state.exc_tag) rb_jump_tag(state.exc_tag);
+        try { std::rethrow_exception(args.err); }
+        catch (const std::exception& e) { raise_mapped_ex(e); }
+    }
+    if (state.exc_tag) {
+        try { c->client->ResetConnection(); } catch (...) {}
+        rb_jump_tag(state.exc_tag);
+    }
+    return self;
+}
+
+// ------------------------------------------------------------------
 // ping / server_version / reset_connection / close
 // ------------------------------------------------------------------
 
@@ -466,6 +816,10 @@ extern "C" void Init_clickhouse_native(void) {
         reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query), 1);
     rb_define_method(rb_cClient, "query_value",
         reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query_value), 1);
+    rb_define_method(rb_cClient, "query_each",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query_each), 1);
+    rb_define_method(rb_cClient, "insert_block",
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_insert_block), 3);
     rb_define_method(rb_cClient, "ping",
         reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_ping), 0);
     rb_define_method(rb_cClient, "server_version",
