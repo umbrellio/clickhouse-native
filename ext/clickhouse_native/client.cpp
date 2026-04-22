@@ -31,10 +31,19 @@ static VALUE rb_cClient;
 static VALUE err_base, err_connection, err_timeout, err_protocol,
              err_server, err_encoder, err_decoder, err_unsupported;
 
-// Internal exception used to tag encoder failures and drive them through
-// raise_mapped_ex -> err_encoder without rb_raising from inside a try block.
+// Internal exceptions used to tag encoder / decoder failures and drive
+// them through raise_mapped_ex -> err_encoder / err_unsupported /
+// err_decoder without rb_raising from inside a try block. Critically,
+// throwing (instead of rb_raise) lets the outer catch run
+// ResetConnection() so the pooled client doesn't stay mid-packet.
 namespace chn {
 class EncoderFailure : public clickhouse::Error {
+    using clickhouse::Error::Error;
+};
+class UnsupportedType : public clickhouse::Error {
+    using clickhouse::Error::Error;
+};
+class DecoderFailure : public clickhouse::Error {
     using clickhouse::Error::Error;
 };
 }  // namespace chn
@@ -56,6 +65,12 @@ static void raise_mapped_ex(const std::exception& e) {
     }
     if (dynamic_cast<const chn::EncoderFailure*>(&e)) {
         rb_raise(err_encoder, "%s", e.what());
+    }
+    if (dynamic_cast<const chn::UnsupportedType*>(&e)) {
+        rb_raise(err_unsupported, "%s", e.what());
+    }
+    if (dynamic_cast<const chn::DecoderFailure*>(&e)) {
+        rb_raise(err_decoder, "%s", e.what());
     }
     if (dynamic_cast<const ProtocolError*>(&e)) {
         rb_raise(err_protocol, "%s", e.what());
@@ -212,7 +227,7 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
             auto tuples = map_col->GetAsColumn(idx);
             auto tuple = tuples->As<ColumnTuple>();
             if (!tuple || tuple->TupleSize() != 2) {
-                rb_raise(err_decoder, "clickhouse-native: malformed Map column");
+                throw chn::DecoderFailure("clickhouse-native: malformed Map column");
             }
             auto keys = (*tuple)[0];
             auto vals = (*tuple)[1];
@@ -242,9 +257,10 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
         }
 
         default:
-            rb_raise(err_unsupported,
-                     "clickhouse-native: unsupported column type %s (code=%d)",
-                     type->GetName().c_str(), static_cast<int>(type->GetCode()));
+            throw chn::UnsupportedType(
+                std::string("clickhouse-native: unsupported column type ")
+                + type->GetName()
+                + " (code=" + std::to_string(static_cast<int>(type->GetCode())) + ")");
     }
     return Qnil;
 }

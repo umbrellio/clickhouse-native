@@ -1,3 +1,13 @@
+# frozen_string_literal: true
+
 source "https://rubygems.org"
 
 gemspec
+
+# Build deps needed inside rake-compiler-dock for `rake native:<platform> gem`.
+# Mirrors the :development group in Gemfile but drops the git-sourced
+# benchmark/lint gems that caused bundler 4 to choke.
+gem "rake", "~> 13.2"
+gem "rake-compiler", "~> 1.2"
+gem "rake-compiler-dock", "~> 1.9"
+gem "rspec", "~> 3.13"
