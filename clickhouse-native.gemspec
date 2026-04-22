@@ -12,6 +12,7 @@ Gem::Specification.new do |spec|
   spec.description = "A high-performance Ruby client for ClickHouse using the " \
                      "native binary protocol via a C++ extension wrapping clickhouse-cpp."
   spec.license = "Apache-2.0"
+  spec.homepage = "https://github.com/umbrellio/clickhouse-native"
   spec.required_ruby_version = ">= 3.3.0"
 
   vendored_cpp = %r{/vendor/clickhouse-cpp/(?:\.git|bench|tests|ut)/}
