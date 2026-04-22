@@ -432,33 +432,6 @@ static VALUE ch_client_close(VALUE self) {
 }
 
 // ------------------------------------------------------------------
-// Backward-compat: ClickhouseNative.hello(host, port) — Spike 1 smoke test
-// ------------------------------------------------------------------
-
-static VALUE ch_hello(int argc, VALUE* argv, VALUE /*self*/) {
-    VALUE rb_host = Qnil, rb_port = Qnil;
-    rb_scan_args(argc, argv, "02", &rb_host, &rb_port);
-    std::string host = NIL_P(rb_host) ? "localhost" : StringValueCStr(rb_host);
-    uint16_t port = NIL_P(rb_port) ? 9000 : static_cast<uint16_t>(NUM2UINT(rb_port));
-
-    try {
-        Client client(ClientOptions().SetHost(host).SetPort(port));
-        uint64_t result = 0;
-        bool saw_row = false;
-        client.Select("SELECT toUInt64(42)", [&](const Block& block) {
-            if (block.GetRowCount() == 0) return;
-            auto col = block[0]->As<ColumnUInt64>();
-            if (col && col->Size() > 0) { result = col->At(0); saw_row = true; }
-        });
-        if (!saw_row) rb_raise(err_base, "clickhouse-native: no rows");
-        return ULL2NUM(result);
-    } catch (const std::exception& e) {
-        raise_mapped_ex(e);
-    }
-    return Qnil;
-}
-
-// ------------------------------------------------------------------
 // Init
 // ------------------------------------------------------------------
 
@@ -501,7 +474,4 @@ extern "C" void Init_clickhouse_native(void) {
         reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_reset_connection), 0);
     rb_define_method(rb_cClient, "close",
         reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_close), 0);
-
-    rb_define_singleton_method(rb_mClickhouseNative, "hello",
-        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_hello), -1);
 }
