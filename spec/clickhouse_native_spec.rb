@@ -55,7 +55,12 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
 
   describe "#query" do
     it "returns an array of symbol-keyed hashes" do
-      rows = client.query("SELECT 1 AS a, 2 AS b UNION ALL SELECT 3 AS a, 4 AS b ORDER BY a")
+      # Outer SELECT so ORDER BY spans both UNION branches; without it
+      # ORDER BY binds to the second SELECT only and CH 24.x can return
+      # the two branches' blocks in arbitrary order.
+      rows = client.query(<<~SQL)
+        SELECT * FROM (SELECT 1 AS a, 2 AS b UNION ALL SELECT 3 AS a, 4 AS b) ORDER BY a
+      SQL
       expect(rows).to eq([{ a: 1, b: 2 }, { a: 3, b: 4 }])
     end
 
