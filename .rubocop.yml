@@ -15,5 +15,10 @@ Style/GlobalVars:
   Exclude:
     - "ext/**/extconf.rb"
 
+# Hyphenated shim matching the gem name — Bundler's auto-require lands here.
+Naming/FileName:
+  Exclude:
+    - "lib/clickhouse-native.rb"
+
 Metrics/ParameterLists:
   CountKeywordArgs: false

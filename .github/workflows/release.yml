@@ -18,7 +18,7 @@ jobs:
           submodules: recursive
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.3"
+          ruby-version: "4.0"
           bundler-cache: true
       - name: Build source gem
         run: bundle exec rake build
@@ -44,7 +44,7 @@ jobs:
           submodules: recursive
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.3"
+          ruby-version: "4.0"
           bundler-cache: true
       - name: Cross-compile ${{ matrix.platform }}
         run: bundle exec rake gem:cross:${{ matrix.platform }}
