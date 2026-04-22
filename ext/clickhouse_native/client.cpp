@@ -374,6 +374,20 @@ static uint16_t kwarg_uint16(VALUE kwargs, const char* key, uint16_t fallback) {
     return static_cast<uint16_t>(NUM2UINT(v));
 }
 
+static CompressionMethod kwarg_compression(VALUE kwargs) {
+    VALUE v = rb_hash_lookup2(kwargs, ID2SYM(rb_intern("compression")), Qundef);
+    if (v == Qundef || NIL_P(v)) return CompressionMethod::None;
+    ID sym = SYMBOL_P(v) ? SYM2ID(v) : rb_intern(StringValueCStr(v));
+    ID none_id = rb_intern("none");
+    ID lz4_id  = rb_intern("lz4");
+    ID zstd_id = rb_intern("zstd");
+    if (sym == none_id) return CompressionMethod::None;
+    if (sym == lz4_id)  return CompressionMethod::LZ4;
+    if (sym == zstd_id) return CompressionMethod::ZSTD;
+    rb_raise(rb_eArgError, "clickhouse-native: unknown compression %s (expected :none, :lz4, :zstd)",
+             rb_id2name(sym));
+}
+
 // Client.new(host:, port:, database:, user:, password:)
 static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
     VALUE kwargs = Qnil;
@@ -385,12 +399,14 @@ static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
     std::string database = kwarg_str(kwargs, "database", "default");
     std::string user = kwarg_str(kwargs, "user", "default");
     std::string password = kwarg_str(kwargs, "password", "");
+    CompressionMethod compression = kwarg_compression(kwargs);
 
     CHClient* c = as_client(self);
     try {
         ClientOptions opts;
         opts.SetHost(host).SetPort(port)
-            .SetDefaultDatabase(database).SetUser(user).SetPassword(password);
+            .SetDefaultDatabase(database).SetUser(user).SetPassword(password)
+            .SetCompressionMethod(compression);
         c->client = std::make_unique<Client>(opts);
     } catch (const std::exception& e) {
         raise_mapped_ex(e);

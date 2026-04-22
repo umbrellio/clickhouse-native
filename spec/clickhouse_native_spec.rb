@@ -282,6 +282,27 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
       30.times { expect(client.query_value("SELECT 1")).to eq(1) }
     end
   end
+
+  describe "compression" do
+    it "round-trips identically under :lz4" do
+      lz4 = described_class.new(**CH_KWARGS, compression: :lz4)
+      expect(lz4.query_value("SELECT count() FROM numbers(1000)")).to eq(1000)
+      rows = lz4.query("SELECT number AS n FROM numbers(10)")
+      expect(rows.map { |r| r[:n] }).to eq((0..9).to_a)
+      lz4.close
+    end
+
+    it "round-trips identically under :zstd" do
+      z = described_class.new(**CH_KWARGS, compression: :zstd)
+      expect(z.query_value("SELECT count() FROM numbers(1000)")).to eq(1000)
+      z.close
+    end
+
+    it "rejects unknown compression at construction" do
+      expect { described_class.new(**CH_KWARGS, compression: :snappy) }
+        .to raise_error(ArgumentError, /compression/)
+    end
+  end
 end
 
 RSpec.describe ClickhouseNative::Pool, :clickhouse do
