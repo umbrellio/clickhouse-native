@@ -1,0 +1,14 @@
+*.gem
+*.bundle
+*.so
+*.o
+*.a
+Makefile
+mkmf.log
+ext/**/build/
+ext/**/Makefile
+lib/clickhouse_native/clickhouse_native.{so,bundle}
+tmp/
+pkg/
+.bundle/
+Gemfile.lock
