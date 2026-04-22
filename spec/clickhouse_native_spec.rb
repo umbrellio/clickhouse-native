@@ -148,18 +148,25 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
     end
 
     context "advanced types not supported by clickhouse-cpp v2.6.1" do
+      # On CH 24.x these types require allow_experimental_*_type = 1 at the
+      # server. The SETTINGS clauses make the server accept the cast on both
+      # 24.x and 25.x so the error always comes from our decoder.
       it "rejects Dynamic with UnsupportedTypeError" do
-        expect { client.query("SELECT CAST(42 AS Dynamic) AS d") }
+        sql = "SELECT CAST(42 AS Dynamic) AS d SETTINGS allow_experimental_dynamic_type = 1"
+        expect { client.query(sql) }
           .to raise_error(ClickhouseNative::UnsupportedTypeError, /Dynamic/)
       end
 
       it "rejects Variant with UnsupportedTypeError" do
-        expect { client.query("SELECT CAST(toUInt64(42), 'Variant(UInt64, String)') AS v") }
+        sql = "SELECT CAST(toUInt64(42), 'Variant(UInt64, String)') AS v " \
+              "SETTINGS allow_experimental_variant_type = 1"
+        expect { client.query(sql) }
           .to raise_error(ClickhouseNative::UnsupportedTypeError, /Variant/)
       end
 
       it "rejects typed JSON with UnsupportedTypeError" do
-        expect { client.query("SELECT CAST('{\"a\":1}', 'JSON') AS j") }
+        sql = "SELECT CAST('{\"a\":1}', 'JSON') AS j SETTINGS allow_experimental_json_type = 1"
+        expect { client.query(sql) }
           .to raise_error(ClickhouseNative::UnsupportedTypeError, /JSON/)
       end
     end
