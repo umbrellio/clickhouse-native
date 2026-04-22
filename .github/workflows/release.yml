@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  source-gem:
+    name: Build & push source gem
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+      - name: Build source gem
+        run: bundle exec rake build
+      - name: Push to RubyGems
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: gem push pkg/*.gem
+
+  native-gems:
+    name: Build & push native gem (${{ matrix.platform }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-darwin
+          - arm64-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+      - name: Cross-compile ${{ matrix.platform }}
+        run: bundle exec rake gem:cross:${{ matrix.platform }}
+      - name: Push to RubyGems
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: gem push pkg/*-${{ matrix.platform }}.gem
