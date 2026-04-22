@@ -101,5 +101,27 @@ RSpec.describe ClickhouseNative do
     it "surfaces a server error as a Ruby exception" do
       expect { query("SELECT no_such_function()") }.to raise_error(RuntimeError, /clickhouse-native/)
     end
+
+    # Spike 3 findings: clickhouse-cpp v2.6.1 has no ColumnDynamic / ColumnVariant
+    # / typed-JSON implementation. The column factory throws at block parse
+    # before our codec runs. These specs pin that behaviour so call sites can
+    # catch the exception and fall back (server-side toString() rewrite) until
+    # a proper implementation lands.
+    context "advanced types (not supported by clickhouse-cpp v2.6.1)" do
+      it "rejects Dynamic columns with a clear message" do
+        expect { query("SELECT CAST(42 AS Dynamic) AS d") }
+          .to raise_error(RuntimeError, /unsupported column type: Dynamic/)
+      end
+
+      it "rejects Variant columns with a clear message" do
+        expect { query("SELECT CAST(toUInt64(42), 'Variant(UInt64, String)') AS v") }
+          .to raise_error(RuntimeError, /unsupported column type: Variant/)
+      end
+
+      it "rejects typed JSON columns with a clear message" do
+        expect { query("SELECT CAST('{\"a\":1}', 'JSON') AS j") }
+          .to raise_error(RuntimeError, /unsupported column type: JSON/)
+      end
+    end
   end
 end
