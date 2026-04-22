@@ -52,3 +52,16 @@ jobs:
         env:
           GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
         run: gem push pkg/*-${{ matrix.platform }}.gem
+
+  github-release:
+    name: Create GitHub release
+    needs: [source-gem, native-gems]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create release with auto-generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
