@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "time"
+require "date"
 require "bigdecimal"
 require "clickhouse_native/version"
 require "clickhouse_native/errors"

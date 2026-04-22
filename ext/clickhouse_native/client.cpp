@@ -174,16 +174,24 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
         }
 
         case Type::Date: {
-            auto t = col->As<ColumnDate>()->At(idx);
-            return rb_time_new(t, 0);
+            // Return a Ruby Date so as_json/to_s gives "YYYY-MM-DD" instead of
+            // a full ISO8601 timestamp. CH Date is days since 1970-01-01 UTC.
+            std::time_t t = col->As<ColumnDate>()->At(idx);
+            long days = static_cast<long>(t / 86400);
+            VALUE rb_cDate = rb_const_get(rb_cObject, rb_intern("Date"));
+            return rb_funcall(rb_cDate, rb_intern("jd"), 1, LONG2NUM(days + 2440588));
         }
         case Type::Date32: {
-            auto t = col->As<ColumnDate32>()->At(idx);
-            return rb_time_new(t, 0);
+            std::time_t t = col->As<ColumnDate32>()->At(idx);
+            long days = static_cast<long>(t / 86400);
+            VALUE rb_cDate = rb_const_get(rb_cObject, rb_intern("Date"));
+            return rb_funcall(rb_cDate, rb_intern("jd"), 1, LONG2NUM(days + 2440588));
         }
         case Type::DateTime: {
             auto t = col->As<ColumnDateTime>()->At(idx);
-            return rb_time_new(t, 0);
+            VALUE rb_t = rb_time_new(t, 0);
+            rb_funcall(rb_t, rb_intern("utc"), 0);
+            return rb_t;
         }
         case Type::DateTime64: {
             auto ct = col->As<ColumnDateTime64>();
@@ -194,7 +202,9 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
             int64_t frac = ticks % denom;
             int64_t usec = (prec <= 6) ? frac * pow10_i64(6 - prec)
                                        : frac / pow10_i64(prec - 6);
-            return rb_time_new(secs, usec);
+            VALUE rb_t = rb_time_new(secs, usec);
+            rb_funcall(rb_t, rb_intern("utc"), 0);
+            return rb_t;
         }
 
         case Type::Array: {
@@ -340,6 +350,28 @@ static bool has_trailing_tz(const char* s, size_t len) {
     return false;
 }
 
+// For Date columns: normalise the value to its UTC-midnight epoch so the
+// calendar day is preserved regardless of the process's local timezone.
+// Handles Date, DateTime, Time, String ("YYYY-MM-DD" etc.), Integer epoch.
+static int64_t coerce_to_date_epoch(VALUE value) {
+    if (RB_INTEGER_TYPE_P(value)) return NUM2LL(value);
+    VALUE date_src = value;
+    if (RB_TYPE_P(value, T_STRING)) {
+        VALUE rb_cDate = rb_const_get(rb_cObject, rb_intern("Date"));
+        date_src = rb_funcall(rb_cDate, rb_intern("parse"), 1, value);
+    } else if (rb_respond_to(value, rb_intern("hour"))) {
+        // Time / DateTime: take the wall-clock date portion as UTC midnight.
+        // We intentionally ignore the TZ offset here — callers who need
+        // strict moment semantics should use DateTime64 instead.
+        date_src = value;
+    }
+    VALUE y = rb_funcall(date_src, rb_intern("year"), 0);
+    VALUE m = rb_funcall(date_src, rb_intern("month"), 0);
+    VALUE d = rb_funcall(date_src, rb_intern("day"), 0);
+    VALUE utc = rb_funcall(rb_cTime, rb_intern("utc"), 3, y, m, d);
+    return NUM2LL(rb_funcall(utc, rb_intern("to_i"), 0));
+}
+
 // Accepts a Time, a String (parsed via Time.parse), or a numeric (epoch
 // seconds). Mirrors how the HTTP gem's JSONEachRow coerced date cells.
 //
@@ -429,16 +461,8 @@ static void append_value(const ColumnRef& col, VALUE value) {
             return;
         }
 
-        case Type::Date: {
-            VALUE t = coerce_to_time(value);
-            col->As<ColumnDate>()->Append(static_cast<std::time_t>(NUM2LL(rb_funcall(t, rb_intern("to_i"), 0))));
-            return;
-        }
-        case Type::Date32: {
-            VALUE t = coerce_to_time(value);
-            col->As<ColumnDate32>()->Append(static_cast<std::time_t>(NUM2LL(rb_funcall(t, rb_intern("to_i"), 0))));
-            return;
-        }
+        case Type::Date:   col->As<ColumnDate>()->Append(static_cast<std::time_t>(coerce_to_date_epoch(value))); return;
+        case Type::Date32: col->As<ColumnDate32>()->Append(static_cast<std::time_t>(coerce_to_date_epoch(value))); return;
         case Type::DateTime: {
             VALUE t = coerce_to_time(value);
             col->As<ColumnDateTime>()->Append(static_cast<std::time_t>(NUM2LL(rb_funcall(t, rb_intern("to_i"), 0))));
