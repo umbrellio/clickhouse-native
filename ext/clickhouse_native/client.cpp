@@ -4,6 +4,7 @@
 #include <clickhouse/client.h>
 #include <clickhouse/columns/array.h>
 #include <clickhouse/columns/date.h>
+#include <clickhouse/columns/decimal.h>
 #include <clickhouse/columns/enum.h>
 #include <clickhouse/columns/factory.h>
 #include <clickhouse/columns/lowcardinality.h>
@@ -99,6 +100,55 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
         case Type::Float32: return DBL2NUM(col->As<ColumnFloat32>()->At(idx));
         case Type::Float64: return DBL2NUM(col->As<ColumnFloat64>()->At(idx));
 
+        case Type::Decimal:
+        case Type::Decimal32:
+        case Type::Decimal64:
+        case Type::Decimal128: {
+            // ClickHouse stores decimals as scaled integers. clickhouse-cpp
+            // returns them as Int128. To preserve precision, we format the
+            // unscaled int into a string at the column's scale and construct
+            // a BigDecimal from it.
+            auto dec = col->As<ColumnDecimal>();
+            auto unscaled = dec->At(idx);  // Int128 (absl::int128)
+            size_t scale = type->As<DecimalType>()->GetScale();
+
+            bool neg = unscaled < 0;
+            absl::uint128 mag = neg
+                ? absl::uint128(-static_cast<absl::int128>(unscaled))
+                : absl::uint128(static_cast<absl::int128>(unscaled));
+
+            // Render magnitude in base 10, then place the decimal point.
+            char buf[48];
+            int len = 0;
+            if (mag == absl::uint128(0)) {
+                buf[len++] = '0';
+            } else {
+                while (mag > absl::uint128(0)) {
+                    absl::uint128 q = mag / absl::uint128(10);
+                    absl::uint128 r = mag - q * absl::uint128(10);
+                    buf[len++] = '0' + static_cast<int>(absl::Uint128Low64(r));
+                    mag = q;
+                }
+            }
+            // Pad with leading zeros so we have at least scale+1 digits.
+            while (static_cast<size_t>(len) <= scale) buf[len++] = '0';
+
+            std::string out;
+            out.reserve(len + 3);
+            if (neg) out.push_back('-');
+            for (int i = len - 1; i >= 0; i--) {
+                if (scale > 0 && static_cast<size_t>(i) == scale - 1) {
+                    // Insert decimal point before the last `scale` digits.
+                    out.push_back('.');
+                }
+                out.push_back(buf[i]);
+            }
+
+            VALUE rb_cBigDecimal = rb_const_get(rb_cObject, rb_intern("BigDecimal"));
+            return rb_funcall(rb_cBigDecimal, rb_intern("BigDecimal"), 1,
+                              rb_utf8_str_new(out.data(), out.size()));
+        }
+
         case Type::String: {
             auto sv = col->As<ColumnString>()->At(idx);
             return rb_utf8_str_new(sv.data(), sv.size());
@@ -149,7 +199,11 @@ static VALUE value_at(const ColumnRef& col, size_t idx) {
 
         case Type::LowCardinality: {
             auto lc = col->As<ColumnLowCardinality>();
-            auto sv = lc->GetItem(idx).AsBinaryData();
+            ItemView item = lc->GetItem(idx);
+            // For LowCardinality(Nullable(T)), clickhouse-cpp's GetItem returns
+            // a default-constructed ItemView (type == Void) for null rows.
+            if (item.type == Type::Void) return Qnil;
+            auto sv = item.AsBinaryData();
             return rb_utf8_str_new(sv.data(), sv.size());
         }
 
@@ -222,6 +276,26 @@ static void append_default(const ColumnRef& col) {
         case Type::Date32:      col->As<ColumnDate32>()->Append(0); return;
         case Type::DateTime:    col->As<ColumnDateTime>()->Append(0); return;
         case Type::DateTime64:  col->As<ColumnDateTime64>()->Append(0); return;
+        case Type::Decimal:
+        case Type::Decimal32:
+        case Type::Decimal64:
+        case Type::Decimal128:   col->As<ColumnDecimal>()->Append(std::string("0")); return;
+        case Type::LowCardinality: {
+            auto nested_type = type->As<LowCardinalityType>()->GetNestedType();
+            bool nullable = nested_type->GetCode() == Type::Nullable;
+            if (!nullable) {
+                auto lct = col->AsStrict<ColumnLowCardinalityT<ColumnString>>();
+                lct->Append(std::string_view());
+            } else {
+                auto tmp_inner = std::make_shared<ColumnString>();
+                auto tmp_nulls = std::make_shared<ColumnUInt8>();
+                tmp_inner->Append(std::string_view());
+                tmp_nulls->Append(1);
+                auto tmp = std::make_shared<ColumnNullable>(tmp_inner, tmp_nulls);
+                col->As<ColumnLowCardinality>()->Append(tmp);
+            }
+            return;
+        }
         case Type::Array: {
             auto inner_type = type->As<ArrayType>()->GetItemType();
             auto inner_col = CreateColumnByType(inner_type->GetName());
@@ -232,6 +306,23 @@ static void append_default(const ColumnRef& col) {
             throw chn::EncoderFailure(
                 "no default value for Nullable(" + type->GetName() + ")");
     }
+}
+
+// Accepts a Time, a String (parsed via Time.parse), or a numeric (epoch
+// seconds). Mirrors how the HTTP gem's JSONEachRow coerced date cells.
+static VALUE coerce_to_time(VALUE value) {
+    if (rb_obj_is_kind_of(value, rb_cTime)) return value;
+    if (RB_TYPE_P(value, T_STRING)) {
+        return rb_funcall(rb_cTime, rb_intern("parse"), 1, value);
+    }
+    if (RB_INTEGER_TYPE_P(value) || RB_FLOAT_TYPE_P(value)) {
+        return rb_funcall(rb_cTime, rb_intern("at"), 1, value);
+    }
+    // Date / DateTime / other responds to to_time
+    if (rb_respond_to(value, rb_intern("to_time"))) {
+        return rb_funcall(value, rb_intern("to_time"), 0);
+    }
+    throw chn::EncoderFailure("cannot coerce value to Time");
 }
 
 static int64_t time_to_datetime64_ticks(VALUE value, size_t prec) {
@@ -246,6 +337,24 @@ static int64_t time_to_datetime64_ticks(VALUE value, size_t prec) {
 
 static void append_value(const ColumnRef& col, VALUE value) {
     auto type = col->Type();
+    // Graceful nil handling for non-Nullable columns — mirrors how the HTTP
+    // gem's JSONEachRow insert silently coerced nil to the column default.
+    // Structural types (Nullable/Array/Map/Tuple/LowCardinality) have their
+    // own nil semantics handled below.
+    if (NIL_P(value)) {
+        auto code = type->GetCode();
+        // Structural types handle nil via their own semantics below.
+        if (code != Type::Nullable && code != Type::Array &&
+            code != Type::Map && code != Type::Tuple) {
+            append_default(col);
+            return;
+        }
+    }
+    // Bool columns come over the wire as UInt8. Ruby true/false are the
+    // natural inputs for Bool, so coerce here before the numeric cases run.
+    if (value == Qtrue) value = INT2FIX(1);
+    else if (value == Qfalse) value = INT2FIX(0);
+
     switch (type->GetCode()) {
         case Type::Int8:    col->As<ColumnInt8>()->Append(NUM2INT(value)); return;
         case Type::Int16:   col->As<ColumnInt16>()->Append(NUM2INT(value)); return;
@@ -272,23 +381,24 @@ static void append_value(const ColumnRef& col, VALUE value) {
         }
 
         case Type::Date: {
-            VALUE to_i = rb_funcall(value, rb_intern("to_i"), 0);
-            col->As<ColumnDate>()->Append(static_cast<std::time_t>(NUM2LL(to_i)));
+            VALUE t = coerce_to_time(value);
+            col->As<ColumnDate>()->Append(static_cast<std::time_t>(NUM2LL(rb_funcall(t, rb_intern("to_i"), 0))));
             return;
         }
         case Type::Date32: {
-            VALUE to_i = rb_funcall(value, rb_intern("to_i"), 0);
-            col->As<ColumnDate32>()->Append(static_cast<std::time_t>(NUM2LL(to_i)));
+            VALUE t = coerce_to_time(value);
+            col->As<ColumnDate32>()->Append(static_cast<std::time_t>(NUM2LL(rb_funcall(t, rb_intern("to_i"), 0))));
             return;
         }
         case Type::DateTime: {
-            VALUE to_i = rb_funcall(value, rb_intern("to_i"), 0);
-            col->As<ColumnDateTime>()->Append(static_cast<std::time_t>(NUM2LL(to_i)));
+            VALUE t = coerce_to_time(value);
+            col->As<ColumnDateTime>()->Append(static_cast<std::time_t>(NUM2LL(rb_funcall(t, rb_intern("to_i"), 0))));
             return;
         }
         case Type::DateTime64: {
             size_t prec = type->As<DateTime64Type>()->GetPrecision();
-            col->As<ColumnDateTime64>()->Append(time_to_datetime64_ticks(value, prec));
+            VALUE t = coerce_to_time(value);
+            col->As<ColumnDateTime64>()->Append(time_to_datetime64_ticks(t, prec));
             return;
         }
 
@@ -318,6 +428,57 @@ static void append_value(const ColumnRef& col, VALUE value) {
                 append_value(inner_col, rb_ary_entry(value, i));
             }
             col->As<ColumnArray>()->AppendAsColumn(inner_col);
+            return;
+        }
+
+        case Type::Decimal:
+        case Type::Decimal32:
+        case Type::Decimal64:
+        case Type::Decimal128: {
+            // Feed the value as a decimal string; clickhouse-cpp's
+            // ColumnDecimal::Append(string) handles the scaling.
+            VALUE str = rb_funcall(value, rb_intern("to_s"), 0);
+            StringValue(str);
+            col->As<ColumnDecimal>()->Append(std::string(RSTRING_PTR(str), RSTRING_LEN(str)));
+            return;
+        }
+
+        case Type::LowCardinality: {
+            // Only LowCardinality(String) and LowCardinality(Nullable(String))
+            // are supported for insert in v1 — this covers the profile-service
+            // use case. Numeric LC dictionaries are rare and can wait.
+            auto nested_type = type->As<LowCardinalityType>()->GetNestedType();
+            bool nullable = nested_type->GetCode() == Type::Nullable;
+            auto inner_type = nullable
+                ? nested_type->As<NullableType>()->GetNestedType()
+                : nested_type;
+            auto inner_code = inner_type->GetCode();
+            if (inner_code != Type::String && inner_code != Type::FixedString) {
+                throw chn::EncoderFailure(
+                    "LowCardinality(" + nested_type->GetName() + ") insert not supported");
+            }
+            if (!nullable) {
+                auto lct = col->AsStrict<ColumnLowCardinalityT<ColumnString>>();
+                StringValue(value);
+                lct->Append(std::string_view(RSTRING_PTR(value), RSTRING_LEN(value)));
+                return;
+            }
+            // LowCardinality(Nullable(T)): the factory returns base
+            // ColumnLowCardinality wrapping ColumnNullable, not the templated
+            // T form. Build a one-row ColumnNullable<String> and Append it —
+            // the base class handles merging into the LC dictionary.
+            auto tmp_inner = std::make_shared<ColumnString>();
+            auto tmp_nulls = std::make_shared<ColumnUInt8>();
+            if (NIL_P(value)) {
+                tmp_inner->Append(std::string_view());
+                tmp_nulls->Append(1);
+            } else {
+                StringValue(value);
+                tmp_inner->Append(std::string_view(RSTRING_PTR(value), RSTRING_LEN(value)));
+                tmp_nulls->Append(0);
+            }
+            auto tmp = std::make_shared<ColumnNullable>(tmp_inner, tmp_nulls);
+            col->As<ColumnLowCardinality>()->Append(tmp);
             return;
         }
 
@@ -415,6 +576,9 @@ static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
     rb_ivar_set(self, rb_intern("@host"), rb_utf8_str_new(host.data(), host.size()));
     rb_ivar_set(self, rb_intern("@port"), UINT2NUM(port));
     rb_ivar_set(self, rb_intern("@database"), rb_utf8_str_new(database.data(), database.size()));
+
+    VALUE logger = rb_hash_lookup2(kwargs, ID2SYM(rb_intern("logger")), Qnil);
+    rb_ivar_set(self, rb_intern("@logger"), logger);
     return self;
 }
 
@@ -466,7 +630,8 @@ static VALUE ch_client_execute(VALUE self, VALUE rb_sql) {
 }
 
 // ------------------------------------------------------------------
-// query() — synchronous, GVL held (streaming query_each comes in Week 5)
+// query() — buffers all rows into an array; GVL is held for the duration.
+// See query_each below for a streaming, GVL-releasing variant.
 // ------------------------------------------------------------------
 
 static VALUE ch_client_query(VALUE self, VALUE rb_sql) {

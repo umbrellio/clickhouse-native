@@ -3,8 +3,8 @@ require "connection_pool"
 module ClickhouseNative
   class Pool
     def initialize(host:, port:, database: "default", user: "default", password: "",
-                   compression: :none, pool_size: 5, pool_timeout: 5)
-      client_kwargs = {host:, port:, database:, user:, password:, compression:}
+                   compression: :none, logger: nil, pool_size: 5, pool_timeout: 5)
+      client_kwargs = {host:, port:, database:, user:, password:, compression:, logger:}
       @pool = ConnectionPool.new(size: pool_size, timeout: pool_timeout) do
         Client.new(**client_kwargs)
       end

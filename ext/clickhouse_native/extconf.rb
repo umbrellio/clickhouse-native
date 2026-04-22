@@ -64,25 +64,48 @@ end
 
 FileUtils.mkdir_p(BUILD_DIR)
 
+darwin_cross = ARCH.include?("darwin") && Dir.exist?("/opt/osxcross")
+
+build_env = {}
+configure_args = [
+  "cmake",
+  "-S", VENDOR,
+  "-B", BUILD_DIR,
+  "-DCMAKE_C_COMPILER=#{cc.split.first}",
+  "-DCMAKE_CXX_COMPILER=#{cxx.split.first}",
+  "-DBUILD_SHARED_LIBS=OFF",
+  "-DBUILD_BENCHMARK=OFF",
+  "-DBUILD_TESTS=OFF",
+  "-DWITH_OPENSSL=OFF",
+  "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+  "-DCMAKE_BUILD_TYPE=Release",
+]
+
+if darwin_cross
+  # osxcross defaults MACOSX_DEPLOYMENT_TARGET to 10.13, but
+  # clickhouse-cpp calls std::optional::value() which libc++ marks
+  # unavailable below 10.14. Force the deployment target and disable
+  # libc++'s availability annotations.
+  build_env["MACOSX_DEPLOYMENT_TARGET"] = "10.15"
+  darwin_cxxflags = "-mmacosx-version-min=10.15 -D_LIBCPP_DISABLE_AVAILABILITY"
+  configure_args << "-DCMAKE_C_FLAGS=#{darwin_cxxflags}"
+  configure_args << "-DCMAKE_CXX_FLAGS=#{darwin_cxxflags}"
+  # Mach-O static archives need the osxcross ar/ranlib; the host's
+  # GNU ar leaves them without a table of contents that Apple's ld
+  # can read. cmake resolves relative FILEPATH to CWD, so use the
+  # absolute osxcross bindir.
+  prefix = cxx.split.first.sub(/-clang\+\+.*\z/, "")
+  osxcross_bin = "/opt/osxcross/target/bin"
+  configure_args << "-DCMAKE_AR=#{osxcross_bin}/#{prefix}-ar"
+  configure_args << "-DCMAKE_RANLIB=#{osxcross_bin}/#{prefix}-ranlib"
+end
+
 unless File.exist?(File.join(BUILD_DIR, "CMakeCache.txt"))
-  configure_args = [
-    "cmake",
-    "-S", VENDOR,
-    "-B", BUILD_DIR,
-    "-DCMAKE_C_COMPILER=#{cc.split.first}",
-    "-DCMAKE_CXX_COMPILER=#{cxx.split.first}",
-    "-DBUILD_SHARED_LIBS=OFF",
-    "-DBUILD_BENCHMARK=OFF",
-    "-DBUILD_TESTS=OFF",
-    "-DWITH_OPENSSL=OFF",
-    "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-    "-DCMAKE_BUILD_TYPE=Release",
-  ]
-  system(*configure_args) or fatal("cmake configure failed. See #{BUILD_DIR}/CMakeFiles/CMakeOutput.log")
+  system(build_env, *configure_args) or fatal("cmake configure failed. See #{BUILD_DIR}/CMakeFiles/CMakeOutput.log")
 end
 
 jobs = ENV.fetch("MAKE_JOBS") { Etc.nprocessors.to_s }
-system("cmake", "--build", BUILD_DIR, "--parallel", jobs) or fatal("cmake build failed")
+system(build_env, "cmake", "--build", BUILD_DIR, "--parallel", jobs) or fatal("cmake build failed")
 
 inc_dirs = [
   VENDOR,
@@ -99,6 +122,12 @@ ordered_libs = main + contribs
 $CXXFLAGS = "#{$CXXFLAGS} -std=c++17 #{inc_dirs.map { |d| "-I#{d}" }.join(' ')}"
 $CPPFLAGS = "#{$CPPFLAGS} #{inc_dirs.map { |d| "-I#{d}" }.join(' ')}"
 $LDFLAGS = "#{$LDFLAGS} #{ordered_libs.map(&:shellescape).join(' ')}"
+
+if darwin_cross
+  darwin_flags = "-mmacosx-version-min=10.15 -D_LIBCPP_DISABLE_AVAILABILITY"
+  $CXXFLAGS = "#{$CXXFLAGS} #{darwin_flags}"
+  $LDFLAGS = "#{$LDFLAGS} -mmacosx-version-min=10.15"
+end
 
 have_library("c++") || have_library("stdc++")
 

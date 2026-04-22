@@ -92,6 +92,12 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         expect(row[:u64]).to eq(18_446_744_073_709_551_615)
       end
 
+      it "decodes Decimal round-trip as BigDecimal" do
+        row = client.query("SELECT toDecimal64('123.456789', 6) AS d, toDecimal128('-1.5', 2) AS e").first
+        expect(row[:d]).to eq(BigDecimal("123.456789"))
+        expect(row[:e]).to eq(BigDecimal("-1.5"))
+      end
+
       it "decodes Float32 / Float64" do
         row = client.query("SELECT toFloat32(1.5) AS f32, toFloat64(3.141592653589793) AS f64").first
         expect(row[:f32]).to be_within(1e-6).of(1.5)
@@ -209,6 +215,24 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         client.insert("u", [{m: {"a" => 1}}], db_name: "chn_ins_test")
       }.to raise_error(ClickhouseNative::EncoderError, /Map/)
     end
+
+    it "inserts into LowCardinality(String) and LowCardinality(Nullable(String))" do
+      client.execute(<<~SQL)
+        CREATE TABLE chn_ins_test.lc (
+          category LowCardinality(String),
+          tag      LowCardinality(Nullable(String))
+        ) ENGINE = Memory
+      SQL
+      client.insert("lc", [
+        {category: "a", tag: "x"},
+        {category: "b", tag: nil},
+      ], db_name: "chn_ins_test")
+      rows = client.query("SELECT category, tag FROM chn_ins_test.lc ORDER BY category")
+      expect(rows).to eq([
+        {category: "a", tag: "x"},
+        {category: "b", tag: nil},
+      ])
+    end
   end
 
   describe "#query_each" do
@@ -280,6 +304,27 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
   describe "connection reuse" do
     it "serves many queries on one underlying socket" do
       30.times { expect(client.query_value("SELECT 1")).to eq(1) }
+    end
+  end
+
+  describe "logger" do
+    it "logs each SQL statement with elapsed time at :debug" do
+      io = StringIO.new
+      logger = Logger.new(io, level: :debug, formatter: ->(_, _, _, m) { "#{m}\n" })
+      c = described_class.new(**CH_KWARGS, logger: logger)
+      c.query_value("SELECT 42")
+      c.close
+      lines = io.string.lines
+      expect(lines).to include(match(/\(\d+\.\d{3}ms\) SELECT 42/))
+    end
+
+    it "logs errors at :error" do
+      io = StringIO.new
+      logger = Logger.new(io, level: :debug, formatter: ->(sev, _, _, m) { "#{sev}: #{m}\n" })
+      c = described_class.new(**CH_KWARGS, logger: logger)
+      expect { c.query("SELECT no_such_function()") }.to raise_error(ClickhouseNative::ServerError)
+      c.close
+      expect(io.string).to include("ERROR:").and include("no_such_function")
     end
   end
 

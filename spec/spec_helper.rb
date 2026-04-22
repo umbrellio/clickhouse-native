@@ -1,3 +1,6 @@
+require "bigdecimal"
+require "logger"
+require "stringio"
 require "clickhouse_native"
 
 CH_HOST = ENV.fetch("CLICKHOUSE_HOST", "localhost")
