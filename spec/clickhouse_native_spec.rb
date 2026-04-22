@@ -389,4 +389,53 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
   it "#with yields a Client handle" do
     pool.with { |c| expect(c).to be_a(ClickhouseNative::Client) }
   end
+
+  it "exposes host/port/database" do
+    expect(pool.host).to eq(CH_HOST)
+    expect(pool.port).to eq(CH_PORT)
+    expect(pool.database).to eq("default")
+  end
+
+  describe "settings:" do
+    it "applies Integer settings to every client on checkout" do
+      p = described_class.new(**CH_KWARGS, pool_size: 2, settings: {max_threads: 7})
+      expect(p.query_value("SELECT getSetting('max_threads')")).to eq(7)
+    end
+
+    it "applies multiple settings in one SET" do
+      p = described_class.new(
+        **CH_KWARGS,
+        pool_size: 2,
+        settings: {max_threads: 3, max_execution_time: 42},
+      )
+      expect(p.query_value("SELECT getSetting('max_threads')")).to eq(3)
+      expect(p.query_value("SELECT getSetting('max_execution_time')")).to eq(42)
+    end
+
+    it "quotes non-numeric values as SQL strings" do
+      p = described_class.new(
+        **CH_KWARGS,
+        pool_size: 1,
+        settings: {log_comment: "chn-spec"},
+      )
+      expect(p.query_value("SELECT getSetting('log_comment')")).to eq("chn-spec")
+    end
+
+    it "applies the setting to every connection, not just the first" do
+      # 4 clients, 8 concurrent reads — each must see the setting regardless
+      # of which client the pool hands out.
+      p = described_class.new(**CH_KWARGS, pool_size: 4, settings: {max_threads: 11})
+      results = Array.new(8).map do
+        Thread.new { p.query_value("SELECT getSetting('max_threads')") }
+      end.map(&:value)
+      expect(results).to all(eq(11))
+    end
+
+    it "surfaces invalid setting names as ServerError at pool construction" do
+      expect {
+        described_class.new(**CH_KWARGS, pool_size: 1, settings: {no_such_setting: 1})
+          .ping
+      }.to raise_error(ClickhouseNative::ServerError, /setting/i)
+    end
+  end
 end
