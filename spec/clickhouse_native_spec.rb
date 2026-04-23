@@ -478,5 +478,26 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
           .ping
       end.to raise_error(ClickhouseNative::ServerError, /setting/i)
     end
+
+    # Regression: our C++ bindings call Client::ResetConnection() in every
+    # error path to discard mid-packet state. ResetConnection opens a fresh
+    # socket + handshake, which wipes ALL session-level SET statements.
+    # connection_pool 3.x does not discard on exception — the reset client
+    # goes back to the pool with server-default settings, and subsequent
+    # queries on it run without the settings we declared. The Pool must
+    # detect this and re-apply the SET on the next checkout.
+    it "re-applies settings on the next checkout after a query raised" do
+      p = described_class.new(**CH_KWARGS, pool_size: 1, settings: { max_threads: 5 })
+      expect(p.query_value("SELECT getSetting('max_threads')")).to eq(5)
+
+      # Any ServerError triggers ResetConnection in the C++ binding; the
+      # reset client is returned to the pool with session state wiped.
+      expect { p.query("SELECT no_such_function()") }
+        .to raise_error(ClickhouseNative::ServerError)
+
+      # Next checkout lands on the same (pool_size=1) client. Without the
+      # fix, max_threads reverts to the server default (non-5).
+      expect(p.query_value("SELECT getSetting('max_threads')")).to eq(5)
+    end
   end
 end
