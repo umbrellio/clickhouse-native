@@ -101,7 +101,22 @@ static int64_t pow10_i64(size_t n) {
     return r;
 }
 
-static VALUE value_at(const ColumnRef& col, size_t idx) {
+static VALUE value_at(const ColumnRef& col, size_t idx, const std::string& declared_type = {}) {
+    // clickhouse-cpp normalises Bool -> UInt8 at column-construction time,
+    // so at the codec layer we see UInt8 and can't tell Bool apart without
+    // the declared type string that came over the wire. The patched vendor
+    // tree preserves it on Block; we consume it here for top-level columns.
+    // Nested occurrences (Array(Bool), Map(_, Bool)) are not handled — the
+    // declared type for nested children is not threaded through recursion.
+    if (declared_type == "Bool") {
+        return col->As<ColumnUInt8>()->At(idx) ? Qtrue : Qfalse;
+    }
+    if (declared_type == "Nullable(Bool)") {
+        auto n = col->As<ColumnNullable>();
+        if (n->IsNull(idx)) return Qnil;
+        return n->Nested()->As<ColumnUInt8>()->At(idx) ? Qtrue : Qfalse;
+    }
+
     auto type = col->Type();
     switch (type->GetCode()) {
         case Type::Int8:    return INT2NUM(col->As<ColumnInt8>()->At(idx));
@@ -736,7 +751,8 @@ static VALUE ch_client_query(VALUE self, VALUE rb_sql) {
             for (size_t r = 0; r < nrows; r++) {
                 VALUE h = rb_hash_new();
                 for (size_t cc = 0; cc < ncols; cc++) {
-                    rb_hash_aset(h, ID2SYM(col_ids[cc]), value_at(block[cc], r));
+                    rb_hash_aset(h, ID2SYM(col_ids[cc]),
+                                 value_at(block[cc], r, block.GetColumnType(cc)));
                 }
                 rb_ary_push(rows, h);
             }
@@ -765,7 +781,7 @@ static VALUE ch_client_query_value(VALUE self, VALUE rb_sql) {
         c->client->Select(sql, [&](const Block& block) {
             if (seen) return;
             if (block.GetRowCount() == 0 || block.GetColumnCount() == 0) return;
-            out = value_at(block[0], 0);
+            out = value_at(block[0], 0, block.GetColumnType(0));
             seen = true;
         });
         return out;
@@ -914,7 +930,8 @@ static VALUE yield_rows_body(VALUE arg) {
     for (size_t r = 0; r < nrows; r++) {
         VALUE h = rb_hash_new();
         for (size_t cc = 0; cc < ncols; cc++) {
-            rb_hash_aset(h, ID2SYM(state->col_ids[cc]), value_at(block[cc], r));
+            rb_hash_aset(h, ID2SYM(state->col_ids[cc]),
+                         value_at(block[cc], r, block.GetColumnType(cc)));
         }
         rb_funcall(state->user_proc, rb_intern("call"), 1, h);
     }

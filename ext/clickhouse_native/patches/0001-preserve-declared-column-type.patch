@@ -1,0 +1,74 @@
+diff --git a/clickhouse/block.cpp b/clickhouse/block.cpp
+index 519cfa4..15334c5 100644
+--- a/clickhouse/block.cpp
++++ b/clickhouse/block.cpp
+@@ -53,13 +53,17 @@ Block::Block(size_t cols, size_t rows)
+ Block::~Block() = default;
+ 
+ void Block::AppendColumn(const std::string& name, const ColumnRef& col) {
++    AppendColumn(name, col, std::string());
++}
++
++void Block::AppendColumn(const std::string& name, const ColumnRef& col, const std::string& type) {
+     if (columns_.empty()) {
+         rows_ = col->Size();
+     } else if (col->Size() != rows_) {
+         throw ValidationError("all columns in block must have same count of rows. Name: ["+name+"], rows: ["+std::to_string(rows_)+"], columns: [" + std::to_string(col->Size())+"]");
+     }
+ 
+-    columns_.push_back(ColumnItem{name, col});
++    columns_.push_back(ColumnItem{name, col, type});
+ }
+ 
+ /// Count of columns in the block.
+diff --git a/clickhouse/block.h b/clickhouse/block.h
+index a32cd02..d2263cb 100644
+--- a/clickhouse/block.h
++++ b/clickhouse/block.h
+@@ -67,6 +67,11 @@ public:
+ 
+     /// Append named column to the block.
+     void AppendColumn(const std::string& name, const ColumnRef& col);
++    /// Same, but preserves the declared wire type string (e.g. "Bool",
++    /// "Nullable(Bool)") alongside the column. clickhouse-cpp normalises
++    /// some types at column construction (Bool -> UInt8, etc.), so keep the
++    /// original for callers who need to recover the true declared type.
++    void AppendColumn(const std::string& name, const ColumnRef& col, const std::string& type);
+ 
+     /// Count of columns in the block.
+     size_t GetColumnCount() const;
+@@ -85,6 +90,13 @@ public:
+         return columns_.at(idx).name;
+     }
+ 
++    /// Declared wire type string for the column at `idx` (e.g. "Bool",
++    /// "Nullable(Bool)"). Empty for columns appended via the two-arg
++    /// AppendColumn overload.
++    const std::string& GetColumnType(size_t idx) const {
++        return columns_.at(idx).type;
++    }
++
+     /// Convenience method to wipe out all rows from all columns
+     void Clear();
+ 
+@@ -103,6 +115,7 @@ private:
+     struct ColumnItem {
+         std::string name;
+         ColumnRef   column;
++        std::string type;
+     };
+ 
+     BlockInfo info_;
+diff --git a/clickhouse/client.cpp b/clickhouse/client.cpp
+index a8c8ea6..d81f636 100644
+--- a/clickhouse/client.cpp
++++ b/clickhouse/client.cpp
+@@ -784,7 +784,7 @@ bool Client::Impl::ReadBlock(InputStream& input, Block* block) {
+                 throw ProtocolError("can't load column '" + name + "' of type " + type);
+             }
+ 
+-            block->AppendColumn(name, col);
++            block->AppendColumn(name, col, type);
+         } else {
+             throw UnimplementedError(std::string("unsupported column type: ") + type);
+         }

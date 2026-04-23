@@ -38,6 +38,45 @@ Rake::ExtensionTask.new("clickhouse_native", GEMSPEC) do |ext|
   end
 end
 
+# mkmf's generated Makefile does not invoke cmake, so edits to files
+# under ext/clickhouse_native/vendor/ don't trigger a rebuild of the
+# static library on incremental `rake compile`. Run cmake --build before
+# every compile so the static lib is always current; if the .a advances,
+# drop the extension bundle so mkmf relinks against the new symbols.
+desc "Apply vendor patches and rebuild clickhouse-cpp static lib"
+task :cpp_rebuild do
+  vendor = "ext/clickhouse_native/vendor/clickhouse-cpp"
+  arch = RbConfig::CONFIG["arch"] || "unknown"
+  build_dir = "tmp/cpp-build-#{arch}"
+  next unless File.exist?(File.join(vendor, "CMakeLists.txt"))
+  next unless File.exist?(File.join(build_dir, "CMakeCache.txt"))
+
+  # Re-apply any patches that have been reverted (e.g. after
+  # `git submodule update`), so the build always sees the patched tree.
+  # `patch -d` changes cwd, so the patch input must be an absolute path.
+  Dir["ext/clickhouse_native/patches/*.patch"].map { |p| File.expand_path(p) }.each do |patch|
+    already = system(
+      "patch", "-R", "--dry-run", "-p1", "-s", "-f",
+      "-d", vendor, "-i", patch,
+      out: File::NULL, err: File::NULL
+    )
+    next if already
+    sh "patch", "-p1", "-s", "-f", "-d", vendor, "-i", patch
+  end
+
+  lib_path = File.join(build_dir, "clickhouse", "libclickhouse-cpp-lib.a")
+  before = File.exist?(lib_path) ? File.mtime(lib_path) : nil
+  sh "cmake", "--build", build_dir, "--parallel"
+  after = File.exist?(lib_path) ? File.mtime(lib_path) : nil
+  next unless before && after && after > before
+  Dir.glob("lib/clickhouse_native/**/clickhouse_native.{bundle,so}").each do |f|
+    rm_f(f)
+  end
+end
+
+desc "Run cpp_rebuild before compiling the extension"
+task compile: :cpp_rebuild
+
 RSpec::Core::RakeTask.new(:spec)
 
 task default: %i[compile spec]

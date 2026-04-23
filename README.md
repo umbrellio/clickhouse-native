@@ -257,8 +257,11 @@ Integer and Float values render bare (`SET allow_experimental_analyzer = 1`); an
 | `Map(K, V)`                         | `Hash`                                               |
 | `Tuple(T1, T2, ...)`                | `Array`                                              |
 | `Enum8`, `Enum16`                   | `Symbol` (the enum name)                             |
+| `Bool`, `Nullable(Bool)`            | `true` / `false` (or `nil`)                          |
 
 `Dynamic`, `Variant`, typed `JSON`, and other experimental CH 24.x+ types raise `ClickhouseNative::UnsupportedTypeError` on decode.
+
+`Bool` is returned as Ruby `true` / `false` at the top level of a column. clickhouse-cpp normalises `Bool` to `UInt8` internally, so the gem relies on the declared wire type preserved by the in-tree patch under `ext/clickhouse_native/patches/`. Nested occurrences (`Array(Bool)`, `Map(_, Bool)`, `Tuple(..., Bool, ...)`) are decoded as their underlying `UInt8`.
 
 ### Encoding (Ruby → ClickHouse, for `#insert`)
 

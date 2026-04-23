@@ -150,6 +150,26 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         row = client.query(sql).first
         expect(row[:c]).to eq(:blue)
       end
+
+      it "decodes Bool as Ruby true/false (not Integer 0/1)" do
+        row = client.query("SELECT true::Bool AS t, false::Bool AS f").first
+        expect(row[:t]).to be(true)
+        expect(row[:f]).to be(false)
+      end
+
+      it "decodes Nullable(Bool) as Ruby Boolean or nil" do
+        sql = "SELECT true::Nullable(Bool) AS t, false::Nullable(Bool) AS f, " \
+              "NULL::Nullable(Bool) AS n"
+        row = client.query(sql).first
+        expect(row[:t]).to be(true)
+        expect(row[:f]).to be(false)
+        expect(row[:n]).to be_nil
+      end
+
+      it "decodes Bool through query_value" do
+        expect(client.query_value("SELECT true::Bool")).to be(true)
+        expect(client.query_value("SELECT false::Bool")).to be(false)
+      end
     end
 
     context "advanced types not supported by clickhouse-cpp v2.6.1" do
@@ -235,6 +255,27 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
       expect do
         client.insert("u", [{ m: { "a" => 1 } }], db_name: "chn_ins_test")
       end.to raise_error(ClickhouseNative::EncoderError, /Map/)
+    end
+
+    it "round-trips Bool and Nullable(Bool) as Ruby true/false" do
+      client.execute(<<~SQL)
+        CREATE TABLE chn_ins_test.b (
+          id      UInt32,
+          active  Bool,
+          flag    Nullable(Bool)
+        ) ENGINE = Memory
+      SQL
+      client.insert("b", [
+        { id: 1, active: true,  flag: true },
+        { id: 2, active: false, flag: false },
+        { id: 3, active: true,  flag: nil },
+      ], db_name: "chn_ins_test")
+      rows = client.query("SELECT id, active, flag FROM chn_ins_test.b ORDER BY id")
+      expect(rows).to eq([
+        { id: 1, active: true,  flag: true },
+        { id: 2, active: false, flag: false },
+        { id: 3, active: true,  flag: nil },
+      ])
     end
 
     it "inserts into LowCardinality(String) and LowCardinality(Nullable(String))" do

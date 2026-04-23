@@ -1,3 +1,4 @@
 [submodule "ext/clickhouse_native/vendor/clickhouse-cpp"]
 	path = ext/clickhouse_native/vendor/clickhouse-cpp
 	url = https://github.com/ClickHouse/clickhouse-cpp.git
+	ignore = dirty

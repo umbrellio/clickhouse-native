@@ -35,6 +35,24 @@ unless File.exist?(File.join(VENDOR, "CMakeLists.txt"))
   MSG
 end
 
+# Apply in-tree patches to the vendored clickhouse-cpp before CMake
+# configures/builds it. Patches are idempotent: skip any that already
+# apply in reverse (meaning they've been applied previously).
+PATCHES_DIR = File.expand_path("patches", EXT_DIR)
+if Dir.exist?(PATCHES_DIR)
+  Dir[File.join(PATCHES_DIR, "*.patch")].each do |patch|
+    # -R --check: does the patch apply in reverse? If yes, already applied.
+    already_applied = system(
+      "patch", "-R", "--dry-run", "-p1", "-s", "-f",
+      "-d", VENDOR, "-i", patch,
+      out: File::NULL, err: File::NULL
+    )
+    next if already_applied
+    system("patch", "-p1", "-s", "-f", "-d", VENDOR, "-i", patch) or
+      fatal("failed to apply patch: #{patch}")
+  end
+end
+
 unless find_executable("cmake")
   fatal <<~MSG
     CMake is required to build the vendored clickhouse-cpp library
