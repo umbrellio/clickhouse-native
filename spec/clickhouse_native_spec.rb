@@ -295,6 +295,23 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         { category: "b", tag: nil },
       ])
     end
+
+    it "memoizes the schema across repeated inserts into the same table" do
+      row = { id: 1, name: "a", score: nil, tags: [], created: t }
+      client.insert("t", [row], db_name: "chn_ins_test")
+      first = client.instance_variable_get(:@schema_cache).fetch(%w[chn_ins_test t])
+      client.insert("t", [row], db_name: "chn_ins_test")
+      second = client.instance_variable_get(:@schema_cache).fetch(%w[chn_ins_test t])
+      expect(second).to equal(first)
+    end
+
+    it "drops the memoized schema on clear_schema_cache" do
+      row = { id: 1, name: "a", score: nil, tags: [], created: t }
+      client.insert("t", [row], db_name: "chn_ins_test")
+      expect(client.instance_variable_get(:@schema_cache)).not_to be_empty
+      client.clear_schema_cache("t", db_name: "chn_ins_test")
+      expect(client.instance_variable_get(:@schema_cache)).to be_empty
+    end
   end
 
   describe "#query_each" do

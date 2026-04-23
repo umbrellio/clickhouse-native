@@ -167,7 +167,9 @@ client.insert(
 client.insert("events", [[1, "a", [], Time.now.utc]], db_name: "analytics")
 ```
 
-Without `types:`, `#insert` issues a `DESCRIBE TABLE` once to learn the column types. If you already know them (e.g. you're inserting to the same table in a tight loop), pass them to skip the round-trip:
+Without `types:`, `#insert` issues a `DESCRIBE TABLE` to learn the column types. The result is memoized per `(table, db_name)` on the client, so repeated inserts into the same table don't re-run the lookup. After `ALTER TABLE`, call `#clear_schema_cache` (with no args to drop everything, or `table:` / `db_name:` to drop a single entry).
+
+If you already know the types (e.g. you're driving from a schema you control), pass them to skip the round-trip entirely:
 
 ```ruby
 client.insert(

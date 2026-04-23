@@ -16,6 +16,10 @@ module ClickhouseNative
     # columns in DDL order (for Array<Array>).
     # types may be supplied to skip the DESCRIBE lookup.
     #
+    # The schema lookup is memoized per `(table, db_name)` on the client, so
+    # repeated inserts into the same table don't re-run DESCRIBE. Call
+    # `clear_schema_cache` after `ALTER TABLE` to invalidate.
+    #
     # Hash keys not present in the schema raise ArgumentError — if you need
     # to insert a subset, pass `columns:` explicitly.
     def insert(table, rows, columns: nil, db_name: nil, types: nil)
@@ -33,6 +37,14 @@ module ClickhouseNative
       insert_block(fq, col_pairs, row_arrays)
     end
 
+    # Drop the memoized schema for a table (or all tables). Needed after
+    # DDL that changes column set or types, since insert-time schema
+    # lookups are cached per (table, db_name).
+    def clear_schema_cache(table = nil, db_name: nil)
+      return unless defined?(@schema_cache) && @schema_cache
+      table.nil? ? @schema_cache.clear : @schema_cache.delete([db_name, table.to_s])
+    end
+
     def inspect
       "#<#{self.class} #{host}:#{port}/#{database}>"
     end
@@ -47,7 +59,7 @@ module ClickhouseNative
     end
 
     def columns_from_schema(table, rows, columns, db_name, fqn)
-      schema = describe_table(table, db_name: db_name)
+      schema = cached_schema(table, db_name: db_name)
       type_by_name = schema.to_h { |c| [c[:name], c[:type]] }
       columns ||= rows.first.is_a?(Hash) ? rows.first.keys.map(&:to_s) : schema.map { |c| c[:name] }
       columns.map do |name|
@@ -56,6 +68,12 @@ module ClickhouseNative
           raise ArgumentError, "unknown column #{name_s.inspect} in #{fqn}"
         [name_s, t]
       end
+    end
+
+    def cached_schema(table, db_name:)
+      @schema_cache ||= {}
+      @schema_cache[[db_name, table.to_s]] ||=
+        describe_table(table, db_name: db_name).freeze
     end
 
     def hash_rows_to_arrays(rows, col_pairs)
