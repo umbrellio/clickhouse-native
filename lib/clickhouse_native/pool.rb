@@ -4,8 +4,6 @@ require "connection_pool"
 
 module ClickhouseNative
   class Pool
-    STALE_IVAR = :@clickhouse_native_settings_stale
-
     attr_reader :host, :port, :database
 
     def initialize(host:, port:, database: "default", user: "default", password: "",
@@ -23,19 +21,20 @@ module ClickhouseNative
       end
     end
 
-    # Yields a client with the pool's session settings applied. If the
-    # previous checkout raised (which, in this gem's C++ bindings, always
-    # triggers a ResetConnection that wipes the session), re-apply the SET
-    # before yielding. Exceptions re-raise after marking the client stale.
+    # On exception, discard the client rather than reuse it: an error
+    # path leaves the socket in an unknown state. The C++ binding issues
+    # ResetConnection, but a subsequent send can still surface buffered
+    # protocol errors from the prior aborted operation — those get
+    # attributed to whatever SQL we tried next (e.g. the SET reapplying
+    # session settings), producing misleading log lines and re-raises in
+    # unrelated code. A fresh socket + handshake is cheap relative to
+    # debugging that.
     def with
       @pool.with do |client|
-        reapply_settings_if_stale(client)
-        begin
-          yield client
-        rescue
-          client.instance_variable_set(STALE_IVAR, true)
-          raise
-        end
+        yield client
+      rescue
+        @pool.discard_current_connection(&:close)
+        raise
       end
     end
 
@@ -72,13 +71,6 @@ module ClickhouseNative
     end
 
     private
-
-    def reapply_settings_if_stale(client)
-      return unless @set_sql
-      return unless client.instance_variable_get(STALE_IVAR)
-      client.execute(@set_sql)
-      client.instance_variable_set(STALE_IVAR, false)
-    end
 
     # Render a `SET key1 = val1, key2 = val2` statement once at pool setup
     # so every checked-out connection starts with the same session

@@ -22,5 +22,5 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.extensions = ["ext/clickhouse_native/extconf.rb"]
 
-  spec.add_dependency "connection_pool", ">= 2.4"
+  spec.add_dependency "connection_pool", ">= 2.5.4"
 end
