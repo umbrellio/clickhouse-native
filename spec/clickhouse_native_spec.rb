@@ -250,11 +250,34 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
       expect(client.query_value("SELECT count() FROM chn_ins_test.t")).to eq(0)
     end
 
-    it "surfaces EncoderError when a column type is unsupported for insert" do
-      client.execute("CREATE TABLE chn_ins_test.u (m Map(String, Int32)) ENGINE = Memory")
-      expect do
-        client.insert("u", [{ m: { "a" => 1 } }], db_name: "chn_ins_test")
-      end.to raise_error(ClickhouseNative::EncoderError, /Map/)
+    it "round-trips Map(String, Int32) including empty/nil maps" do
+      client.execute(<<~SQL)
+        CREATE TABLE chn_ins_test.m (id UInt32, attrs Map(String, Int32)) ENGINE = Memory
+      SQL
+      client.insert("m", [
+        { id: 1, attrs: { "a" => 1, "b" => 2 } },
+        { id: 2, attrs: {} },
+        { id: 3, attrs: nil },
+      ], db_name: "chn_ins_test")
+      rows = client.query("SELECT id, attrs FROM chn_ins_test.m ORDER BY id")
+      expect(rows).to eq([
+        { id: 1, attrs: { "a" => 1, "b" => 2 } },
+        { id: 2, attrs: {} },
+        { id: 3, attrs: {} },
+      ])
+    end
+
+    it "inserts into Map(LowCardinality(String), LowCardinality(String))" do
+      client.execute(<<~SQL)
+        CREATE TABLE chn_ins_test.lcm (
+          id    UInt32,
+          attrs Map(LowCardinality(String), LowCardinality(String))
+        ) ENGINE = Memory
+      SQL
+      client.insert("lcm", [{ id: 1, attrs: { "exp" => "v1", "ab" => "control" } }],
+                    db_name: "chn_ins_test")
+      row = client.query("SELECT attrs FROM chn_ins_test.lcm WHERE id = 1").first
+      expect(row[:attrs]).to eq("exp" => "v1", "ab" => "control")
     end
 
     it "round-trips Bool and Nullable(Bool) as Ruby true/false" do
