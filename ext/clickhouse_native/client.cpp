@@ -296,6 +296,20 @@ static VALUE value_at(const ColumnRef& col, size_t idx, const std::string& decla
 
 static void append_value(const ColumnRef& col, VALUE value);
 
+// rb_hash_foreach callback: appends each key/value pair into the columns
+// passed via the context pointer. Used by the Map encoder.
+struct MapInsertCtx {
+    ColumnRef key_col;
+    ColumnRef val_col;
+};
+
+static int append_map_pair(VALUE key, VALUE val, VALUE arg) {
+    auto* ctx = reinterpret_cast<MapInsertCtx*>(arg);
+    append_value(ctx->key_col, key);
+    append_value(ctx->val_col, val);
+    return ST_CONTINUE;
+}
+
 // Append a zero/default value; used for the nested column of Nullable when
 // the flag is set to null. We never expose these bytes to the caller.
 static void append_default(const ColumnRef& col) {
@@ -539,8 +553,8 @@ static void append_value(const ColumnRef& col, VALUE value) {
 
         case Type::LowCardinality: {
             // Only LowCardinality(String) and LowCardinality(Nullable(String))
-            // are supported for insert in v1 — this covers the profile-service
-            // use case. Numeric LC dictionaries are rare and can wait.
+            // are supported for insert. Numeric LC dictionaries are rare and
+            // can wait.
             auto nested_type = type->As<LowCardinalityType>()->GetNestedType();
             bool nullable = nested_type->GetCode() == Type::Nullable;
             auto inner_type = nullable
@@ -573,6 +587,43 @@ static void append_value(const ColumnRef& col, VALUE value) {
             }
             auto tmp = std::make_shared<ColumnNullable>(tmp_inner, tmp_nulls);
             col->As<ColumnLowCardinality>()->Append(tmp);
+            return;
+        }
+
+        case Type::Map: {
+            // CH's wire format for Map(K, V) is Array(Tuple(K, V)). We build
+            // a one-row Map column holding all of this row's pairs and
+            // Append it to the target — ColumnMap exposes only Append(map),
+            // its underlying ColumnArray is private. Nil is treated as an
+            // empty map.
+            if (NIL_P(value)) value = rb_hash_new();
+            Check_Type(value, T_HASH);
+            auto map_type = type->As<MapType>();
+            auto key_type = map_type->GetKeyType();
+            auto val_type = map_type->GetValueType();
+
+            auto key_col = CreateColumnByType(key_type->GetName());
+            auto val_col = CreateColumnByType(val_type->GetName());
+            if (!key_col || !val_col) {
+                throw chn::EncoderFailure(
+                    "cannot create columns for Map(" + key_type->GetName() +
+                    ", " + val_type->GetName() + ")");
+            }
+
+            MapInsertCtx ctx{key_col, val_col};
+            rb_hash_foreach(value, append_map_pair, reinterpret_cast<VALUE>(&ctx));
+
+            auto src_tuple = std::make_shared<ColumnTuple>(
+                std::vector<ColumnRef>{key_col, val_col});
+
+            auto seed_tuple = std::make_shared<ColumnTuple>(std::vector<ColumnRef>{
+                CreateColumnByType(key_type->GetName()),
+                CreateColumnByType(val_type->GetName()),
+            });
+            auto seed_array = std::make_shared<ColumnArray>(seed_tuple);
+            seed_array->AppendAsColumn(src_tuple);
+
+            col->As<ColumnMap>()->Append(std::make_shared<ColumnMap>(seed_array));
             return;
         }
 
