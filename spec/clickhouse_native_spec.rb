@@ -251,7 +251,9 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
     end
 
     it "round-trips Map(String, Int32) including empty/nil maps" do
-      client.execute("CREATE TABLE chn_ins_test.m (id UInt32, attrs Map(String, Int32)) ENGINE = Memory")
+      client.execute(<<~SQL)
+        CREATE TABLE chn_ins_test.m (id UInt32, attrs Map(String, Int32)) ENGINE = Memory
+      SQL
       client.insert("m", [
         { id: 1, attrs: { "a" => 1, "b" => 2 } },
         { id: 2, attrs: {} },
