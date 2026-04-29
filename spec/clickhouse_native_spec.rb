@@ -477,6 +477,41 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
     expect(pool.database).to eq("default")
   end
 
+  describe "ConnectionError retry" do
+    it "retries once after a stale-connection ConnectionError" do
+      attempts = 0
+      result = pool.with do |client|
+        attempts += 1
+        raise ClickhouseNative::ConnectionError, "closed: Success" if attempts == 1
+        client.query_value("SELECT 1")
+      end
+      expect(result).to eq(1)
+      expect(attempts).to eq(2)
+    end
+
+    it "raises after the second ConnectionError" do
+      attempts = 0
+      expect do
+        pool.with do
+          attempts += 1
+          raise ClickhouseNative::ConnectionError, "closed: Success"
+        end
+      end.to raise_error(ClickhouseNative::ConnectionError)
+      expect(attempts).to eq(2)
+    end
+
+    it "does not retry non-connection errors" do
+      attempts = 0
+      expect do
+        pool.with do
+          attempts += 1
+          raise ClickhouseNative::ServerError, "boom"
+        end
+      end.to raise_error(ClickhouseNative::ServerError)
+      expect(attempts).to eq(1)
+    end
+  end
+
   describe "settings:" do
     it "applies Integer settings to every client on checkout" do
       p = described_class.new(**CH_KWARGS, pool_size: 2, settings: { max_threads: 7 })

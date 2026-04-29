@@ -29,11 +29,26 @@ module ClickhouseNative
     # session settings), producing misleading log lines and re-raises in
     # unrelated code. A fresh socket + handshake is cheap relative to
     # debugging that.
+    #
+    # ConnectionError gets one automatic retry: pooled connections that
+    # have been idle long enough for the server / an LB to FIN them
+    # surface as "closed" on the very next recv (errno 0, message
+    # "closed: Success"). Discarding and re-checking out lands a fresh
+    # socket and the operation succeeds. The retry only triggers when
+    # the dead-connection error fired before any data was sent, so
+    # write operations don't risk double-execution from this path.
     def with
-      @pool.with do |client|
-        yield client
-      rescue
-        @pool.discard_current_connection(&:close)
+      attempts = 0
+      begin
+        @pool.with do |client|
+          yield client
+        rescue
+          @pool.discard_current_connection(&:close)
+          raise
+        end
+      rescue ConnectionError
+        attempts += 1
+        retry if attempts == 1
         raise
       end
     end
