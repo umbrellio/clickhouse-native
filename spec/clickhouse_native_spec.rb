@@ -375,6 +375,64 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
     end
   end
 
+  describe "per-query settings:" do
+    before do
+      client.execute("DROP TABLE IF EXISTS chn_settings_final")
+      client.execute(<<~SQL)
+        CREATE TABLE chn_settings_final (id UInt64, v UInt64)
+        ENGINE = ReplacingMergeTree ORDER BY id
+      SQL
+      client.execute("INSERT INTO chn_settings_final VALUES (1, 10)")
+      client.execute("INSERT INTO chn_settings_final VALUES (1, 20)")
+    end
+
+    after { client.execute("DROP TABLE IF EXISTS chn_settings_final") }
+
+    it "applies #final to #query via settings: { final: 1 }" do
+      with_final = client.query("SELECT v FROM chn_settings_final", settings: { final: 1 })
+      expect(with_final.map { |r| r[:v] }).to eq([20])
+    end
+
+    it "applies #final to #query_value" do
+      sum = client.query_value("SELECT sum(v) FROM chn_settings_final", settings: { final: 1 })
+      expect(sum).to eq(20)
+    end
+
+    it "applies #final to #query_each" do
+      rows = []
+      client.query_each("SELECT v FROM chn_settings_final", settings: { final: 1 }) do |r|
+        rows << r
+      end
+      expect(rows.map { |r| r[:v] }).to eq([20])
+    end
+
+    it "applies a setting to #execute" do
+      # readonly=1 blocks DDL/DML; the CREATE here must surface ServerError.
+      expect do
+        client.execute(
+          "CREATE TABLE chn_settings_readonly (id UInt64) ENGINE = Memory",
+          settings: { readonly: 1 },
+        )
+      end.to raise_error(ClickhouseNative::ServerError, /readonly/i)
+      expect(client.query_value("SELECT 1")).to eq(1)
+    end
+
+    it "accepts String keys equivalently to Symbol keys" do
+      rows = client.query("SELECT v FROM chn_settings_final", settings: { "final" => 1 })
+      expect(rows.map { |r| r[:v] }).to eq([20])
+    end
+
+    it "encodes true/false as 1/0" do
+      rows = client.query("SELECT v FROM chn_settings_final", settings: { final: true })
+      expect(rows.map { |r| r[:v] }).to eq([20])
+    end
+
+    it "no-ops with an empty hash" do
+      rows = client.query("SELECT count() AS c FROM chn_settings_final", settings: {})
+      expect(rows.first[:c]).to be >= 1
+    end
+  end
+
   describe "error mapping" do
     it "raises ServerError with code/name/message on server-side failures" do
       expect { client.query("SELECT no_such_function()") }.to raise_error do |err|

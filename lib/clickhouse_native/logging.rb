@@ -12,19 +12,19 @@ module ClickhouseNative
   module Logging
     LEVEL = :debug
 
-    def execute(sql)
+    def execute(sql, **opts)
       log_sql(sql) { super }
     end
 
-    def query(sql)
+    def query(sql, **opts)
       log_sql(sql) { super }
     end
 
-    def query_value(sql)
+    def query_value(sql, **opts)
       log_sql(sql) { super }
     end
 
-    def query_each(sql, &)
+    def query_each(sql, **opts, &)
       log_sql(sql) { super }
     end
 

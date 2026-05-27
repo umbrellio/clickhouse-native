@@ -102,7 +102,7 @@ client.close
 
 ## API
 
-### `#execute(sql)`
+### `#execute(sql, settings: {})`
 
 Runs DDL/DML and discards any result. Returns `nil`. Releases the GVL for the duration of the server round-trip.
 
@@ -111,7 +111,7 @@ client.execute("CREATE TABLE t (id UInt64) ENGINE = Memory")
 client.execute("INSERT INTO t VALUES (1), (2)")
 ```
 
-### `#query(sql)`
+### `#query(sql, settings: {})`
 
 Buffers the full result into an `Array<Hash>` with symbol keys:
 
@@ -122,7 +122,7 @@ client.query("SELECT 1 AS a, 'x' AS b")
 
 Returns `[]` for empty results. Use `#query_each` for large results or when you need to release the GVL mid-iteration.
 
-### `#query_value(sql)`
+### `#query_value(sql, settings: {})`
 
 Returns the first cell of the first row, or `nil` if there are no rows.
 
@@ -131,7 +131,7 @@ client.query_value("SELECT count() FROM events")   # => 1337
 client.query_value("SELECT 1 WHERE 0")             # => nil
 ```
 
-### `#query_each(sql, &block)`
+### `#query_each(sql, settings: {}, &block)`
 
 Streams rows one block at a time, yielding each row hash to the block. Does **not** materialise the full result in memory. The GVL is released while ClickHouse is delivering bytes; it's reacquired only to run your block.
 
@@ -142,6 +142,20 @@ end
 ```
 
 Raising from inside the block (or `throw`-ing past it) aborts the query cleanly — the socket is reset and the client stays usable for the next call.
+
+### Per-query settings
+
+All four read/exec methods (`#execute`, `#query`, `#query_value`, `#query_each`) accept a `settings:` hash that's sent alongside the SQL as ClickHouse session settings — equivalent to URL query params on the HTTP protocol, or a transient `SETTINGS` clause scoped to this single request.
+
+```ruby
+client.query("SELECT * FROM events", settings: { final: 1 })
+client.query_value("SELECT count() FROM events", settings: { max_threads: 1 })
+client.execute("OPTIMIZE TABLE events FINAL", settings: { mutations_sync: 2 })
+```
+
+Keys may be Symbols or Strings. Values go through `#to_s` on the wire; `true` / `false` render as `"1"` / `"0"`. The same setting is also available pool-wide via `Pool.new(settings: ...)` for session-default values — per-call `settings:` is the right tool when only a specific query needs the override.
+
+`#insert` does not accept a `settings:` argument: clickhouse-cpp's block-insert API has no hook for per-request settings. For insert-time tuning, set the setting in the pool's session defaults, or use `#execute` to run an explicit `INSERT ... SETTINGS k=v VALUES ...` statement.
 
 ### `#insert(table, rows, columns: nil, db_name: nil, types: nil)`
 

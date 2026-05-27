@@ -53,20 +53,20 @@ module ClickhouseNative
       end
     end
 
-    def execute(sql)
-      with { |c| c.execute(sql) }
+    def execute(sql, **opts)
+      with { |c| c.execute(sql, **opts) }
     end
 
-    def query(sql)
-      with { |c| c.query(sql) }
+    def query(sql, **opts)
+      with { |c| c.query(sql, **opts) }
     end
 
-    def query_each(sql, &block)
-      with { |c| c.query_each(sql, &block) }
+    def query_each(sql, **opts, &block)
+      with { |c| c.query_each(sql, **opts, &block) }
     end
 
-    def query_value(sql)
-      with { |c| c.query_value(sql) }
+    def query_value(sql, **opts)
+      with { |c| c.query_value(sql, **opts) }
     end
 
     def insert(table, rows, **opts)
