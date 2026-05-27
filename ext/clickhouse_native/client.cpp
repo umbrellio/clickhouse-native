@@ -694,6 +694,38 @@ static CompressionMethod kwarg_compression(VALUE kwargs) {
              rb_id2name(sym));
 }
 
+// Stringify a Ruby setting value for the binary protocol's QuerySettings
+// payload (which is wire-string-typed). Bool maps to "1"/"0" the way the
+// HTTP gem rendered it; everything else goes through #to_s.
+static std::string stringify_setting_value(VALUE v) {
+    if (v == Qtrue)  return "1";
+    if (v == Qfalse) return "0";
+    VALUE s = rb_funcall(v, rb_intern("to_s"), 0);
+    StringValue(s);
+    return std::string(RSTRING_PTR(s), RSTRING_LEN(s));
+}
+
+static int apply_settings_cb(VALUE key, VALUE val, VALUE arg) {
+    auto* q = reinterpret_cast<Query*>(arg);
+    VALUE k = SYMBOL_P(key) ? rb_sym2str(key) : key;
+    StringValue(k);
+    q->SetSetting(
+        std::string(RSTRING_PTR(k), RSTRING_LEN(k)),
+        QuerySettingsField{stringify_setting_value(val), 0});
+    return ST_CONTINUE;
+}
+
+// Read a `settings:` Hash out of the parsed kwargs and stamp each entry
+// onto `q` as a per-query setting. No-op if kwargs is nil or settings is
+// missing/empty. Raises TypeError if settings is not a Hash.
+static void apply_settings(Query& q, VALUE kwargs) {
+    if (NIL_P(kwargs)) return;
+    VALUE settings = rb_hash_lookup2(kwargs, ID2SYM(rb_intern("settings")), Qnil);
+    if (NIL_P(settings)) return;
+    Check_Type(settings, T_HASH);
+    rb_hash_foreach(settings, apply_settings_cb, reinterpret_cast<VALUE>(&q));
+}
+
 // Client.new(host:, port:, database:, user:, password:)
 static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
     VALUE kwargs = Qnil;
@@ -734,7 +766,7 @@ static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
 namespace {
 struct ExecuteNoGVL {
     Client* client;
-    std::string sql;
+    const Query* query;
     std::exception_ptr err;
 };
 }  // namespace
@@ -742,7 +774,7 @@ struct ExecuteNoGVL {
 static void* execute_no_gvl(void* data) {
     auto* a = static_cast<ExecuteNoGVL*>(data);
     try {
-        a->client->Execute(Query(a->sql));
+        a->client->Execute(*a->query);
     } catch (...) {
         a->err = std::current_exception();
     }
@@ -756,12 +788,17 @@ static void execute_unblock(void* data) {
     try { a->client->ResetConnection(); } catch (...) {}
 }
 
-static VALUE ch_client_execute(VALUE self, VALUE rb_sql) {
+static VALUE ch_client_execute(int argc, VALUE* argv, VALUE self) {
+    VALUE rb_sql, kwargs = Qnil;
+    rb_scan_args(argc, argv, "1:", &rb_sql, &kwargs);
     Check_Type(rb_sql, T_STRING);
     CHClient* c = as_client(self);
     if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
 
-    ExecuteNoGVL args{c->client.get(), std::string(StringValueCStr(rb_sql)), nullptr};
+    Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
+    apply_settings(q, kwargs);
+
+    ExecuteNoGVL args{c->client.get(), &q, nullptr};
     rb_thread_call_without_gvl(execute_no_gvl, &args, execute_unblock, &args);
     if (args.err) {
         // clickhouse-cpp may leave the read stream partially consumed when the
@@ -779,16 +816,19 @@ static VALUE ch_client_execute(VALUE self, VALUE rb_sql) {
 // See query_each below for a streaming, GVL-releasing variant.
 // ------------------------------------------------------------------
 
-static VALUE ch_client_query(VALUE self, VALUE rb_sql) {
+static VALUE ch_client_query(int argc, VALUE* argv, VALUE self) {
+    VALUE rb_sql, kwargs = Qnil;
+    rb_scan_args(argc, argv, "1:", &rb_sql, &kwargs);
     Check_Type(rb_sql, T_STRING);
     CHClient* c = as_client(self);
     if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
 
-    std::string sql(StringValueCStr(rb_sql));
     VALUE rows = rb_ary_new();
     try {
         std::vector<ID> col_ids;
-        c->client->Select(sql, [&](const Block& block) {
+        Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
+        apply_settings(q, kwargs);
+        q.OnData([&](const Block& block) {
             size_t ncols = block.GetColumnCount();
             size_t nrows = block.GetRowCount();
             if (nrows == 0) return;
@@ -808,6 +848,7 @@ static VALUE ch_client_query(VALUE self, VALUE rb_sql) {
                 rb_ary_push(rows, h);
             }
         });
+        c->client->Execute(q);
         return rows;
     } catch (const std::exception& e) {
         try { c->client->ResetConnection(); } catch (...) {}
@@ -820,21 +861,25 @@ static VALUE ch_client_query(VALUE self, VALUE rb_sql) {
 // query_value — returns the first cell of the first row, or nil
 // ------------------------------------------------------------------
 
-static VALUE ch_client_query_value(VALUE self, VALUE rb_sql) {
+static VALUE ch_client_query_value(int argc, VALUE* argv, VALUE self) {
+    VALUE rb_sql, kwargs = Qnil;
+    rb_scan_args(argc, argv, "1:", &rb_sql, &kwargs);
     Check_Type(rb_sql, T_STRING);
     CHClient* c = as_client(self);
     if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
 
-    std::string sql(StringValueCStr(rb_sql));
     try {
         VALUE out = Qnil;
         bool seen = false;
-        c->client->Select(sql, [&](const Block& block) {
+        Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
+        apply_settings(q, kwargs);
+        q.OnData([&](const Block& block) {
             if (seen) return;
             if (block.GetRowCount() == 0 || block.GetColumnCount() == 0) return;
             out = value_at(block[0], 0, block.GetColumnType(0));
             seen = true;
         });
+        c->client->Execute(q);
         return out;
     } catch (const std::exception& e) {
         try { c->client->ResetConnection(); } catch (...) {}
@@ -958,7 +1003,7 @@ struct YieldBlockArgs {
 
 struct QueryEachNoGVL {
     Client* client;
-    std::string sql;
+    const Query* query;
     QueryEachState* state;
     std::exception_ptr err;
 };
@@ -1003,12 +1048,7 @@ static void* with_gvl_yield(void* data) {
 static void* query_each_no_gvl(void* data) {
     auto* a = static_cast<QueryEachNoGVL*>(data);
     try {
-        a->client->SelectCancelable(a->sql, [&](const Block& block) -> bool {
-            if (a->state->aborted) return false;
-            YieldBlockArgs ya{&block, a->state};
-            rb_thread_call_with_gvl(with_gvl_yield, &ya);
-            return !a->state->aborted;
-        });
+        a->client->Execute(*a->query);
     } catch (...) {
         a->err = std::current_exception();
     }
@@ -1021,19 +1061,24 @@ static void query_each_unblock(void* data) {
     try { a->client->ResetConnection(); } catch (...) {}
 }
 
-static VALUE ch_client_query_each(VALUE self, VALUE rb_sql) {
+static VALUE ch_client_query_each(int argc, VALUE* argv, VALUE self) {
     rb_need_block();
+    VALUE rb_sql, kwargs = Qnil;
+    rb_scan_args(argc, argv, "1:", &rb_sql, &kwargs);
     Check_Type(rb_sql, T_STRING);
     CHClient* c = as_client(self);
     if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
 
     QueryEachState state{rb_block_proc(), {}, 0, false};
-    QueryEachNoGVL args{
-        c->client.get(),
-        std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)),
-        &state,
-        nullptr,
-    };
+    Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
+    apply_settings(q, kwargs);
+    q.OnDataCancelable([&state](const Block& block) -> bool {
+        if (state.aborted) return false;
+        YieldBlockArgs ya{&block, &state};
+        rb_thread_call_with_gvl(with_gvl_yield, &ya);
+        return !state.aborted;
+    });
+    QueryEachNoGVL args{c->client.get(), &q, &state, nullptr};
 
     rb_thread_call_without_gvl(query_each_no_gvl, &args, query_each_unblock, &args);
 
@@ -1139,13 +1184,13 @@ extern "C" void Init_clickhouse_native(void) {
     rb_define_method(rb_cClient, "initialize",
         reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_initialize), -1);
     rb_define_method(rb_cClient, "execute",
-        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_execute), 1);
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_execute), -1);
     rb_define_method(rb_cClient, "query",
-        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query), 1);
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query), -1);
     rb_define_method(rb_cClient, "query_value",
-        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query_value), 1);
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query_value), -1);
     rb_define_method(rb_cClient, "query_each",
-        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query_each), 1);
+        reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_query_each), -1);
     rb_define_method(rb_cClient, "insert_block",
         reinterpret_cast<VALUE (*)(ANYARGS)>(ch_client_insert_block), 3);
     rb_define_method(rb_cClient, "ping",
