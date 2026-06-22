@@ -172,7 +172,7 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
       end
     end
 
-    context "advanced types not supported by clickhouse-cpp v2.6.1" do
+    context "advanced types not supported by clickhouse-cpp v2.6.2" do
       # On CH 24.x these types require allow_experimental_*_type = 1 at the
       # server. The SETTINGS clauses make the server accept the cast on both
       # 24.x and 25.x so the error always comes from our decoder.
@@ -188,11 +188,29 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         expect { client.query(sql) }
           .to raise_error(ClickhouseNative::UnsupportedTypeError, /Variant/)
       end
+    end
 
-      it "rejects typed JSON with UnsupportedTypeError" do
-        sql = "SELECT CAST('{\"a\":1}', 'JSON') AS j SETTINGS allow_experimental_json_type = 1"
-        expect { client.query(sql) }
-          .to raise_error(ClickhouseNative::UnsupportedTypeError, /JSON/)
+    # JSON support needs CH 25.x+: clickhouse-cpp's string-backed ColumnJSON
+    # relies on output_format_native_write_json_as_string, which 24.x lacks.
+    context "JSON", min_ch_major: 25 do
+      # ColumnJSON is string-backed; reads require
+      # output_format_native_write_json_as_string=1, which the gem injects
+      # automatically on every read path. CH renders dynamically-typed JSON
+      # leaves as strings (e.g. the number 1 reads back as "1"); typed paths
+      # keep their type. We assert CH's actual round-trip behaviour here.
+      it "decodes a JSON column into a Ruby Hash" do
+        row = client.query(
+          %q(SELECT CAST('{"a":1,"nested":{"b":true}}' AS JSON) AS j),
+          settings: CH_JSON_ENABLE,
+        ).first
+        expect(row[:j]).to eq("a" => "1", "nested" => { "b" => true })
+      end
+
+      it "decodes JSON through query_value" do
+        val = client.query_value(
+          %q(SELECT CAST('{"x":"y"}' AS JSON)), settings: CH_JSON_ENABLE
+        )
+        expect(val).to eq("x" => "y")
       end
     end
   end
@@ -264,6 +282,30 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         { id: 1, attrs: { "a" => 1, "b" => 2 } },
         { id: 2, attrs: {} },
         { id: 3, attrs: {} },
+      ])
+    end
+
+    it "round-trips a JSON column from Hash, String, and nil", min_ch_major: 25 do
+      client.execute(<<~SQL, settings: CH_JSON_ENABLE)
+        CREATE TABLE chn_ins_test.j (
+          id    UInt32,
+          doc   JSON,
+          maybe Nullable(JSON)
+        ) ENGINE = Memory
+      SQL
+      client.insert("j", [
+        { id: 1, doc: { "a" => 1, "b" => %w[x y] }, maybe: { "ok" => true } },
+        { id: 2, doc: '{"raw":"passthrough"}', maybe: nil },
+        { id: 3, doc: nil, maybe: { "n" => "m" } },
+      ], db_name: "chn_ins_test")
+      rows = client.query("SELECT id, doc, maybe FROM chn_ins_test.j ORDER BY id")
+      # A Hash is rendered via #to_json; a String is sent verbatim; nil becomes
+      # {} on the non-nullable column and SQL NULL on the nullable one. CH
+      # renders dynamic numeric leaves as strings ("1"), booleans stay native.
+      expect(rows).to eq([
+        { id: 1, doc: { "a" => "1", "b" => %w[x y] }, maybe: { "ok" => true } },
+        { id: 2, doc: { "raw" => "passthrough" }, maybe: nil },
+        { id: 3, doc: {}, maybe: { "n" => "m" } },
       ])
     end
 

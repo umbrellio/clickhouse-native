@@ -274,8 +274,11 @@ Integer and Float values render bare (`SET allow_experimental_analyzer = 1`); an
 | `Tuple(T1, T2, ...)`                | `Array`                                              |
 | `Enum8`, `Enum16`                   | `Symbol` (the enum name)                             |
 | `Bool`, `Nullable(Bool)`            | `true` / `false` (or `nil`)                          |
+| `JSON`, `JSON(...)`                 | `Hash` (parsed from JSON text)                       |
 
-`Dynamic`, `Variant`, typed `JSON`, and other experimental CH 24.x+ types raise `ClickhouseNative::UnsupportedTypeError` on decode.
+`Dynamic`, `Variant`, and other experimental CH 24.x+ types raise `ClickhouseNative::UnsupportedTypeError` on decode.
+
+`JSON` is supported via clickhouse-cpp's experimental string-backed `ColumnJSON`, and **requires ClickHouse 25.x or newer** — the string wire format it relies on (`output_format_native_write_json_as_string`) does not exist on 24.x, and 24.x's experimental JSON uses an incompatible on-wire serialization. Reading a `JSON` column requires the server to serialize it as a string (`output_format_native_write_json_as_string=1`); the gem sets this automatically on every read path, so it just works. A value comes back as a parsed `Hash`. Note that ClickHouse renders *dynamically*-typed JSON leaves as strings — the number `1` round-trips as `"1"`, while booleans and nulls stay native, and explicitly *typed* paths (e.g. `JSON(a UInt32)`) keep their type. This mirrors `toJSONString(col)` on the server.
 
 `Bool` is returned as Ruby `true` / `false` at the top level of a column. clickhouse-cpp normalises `Bool` to `UInt8` internally, so the gem relies on the declared wire type preserved by the in-tree patch under `ext/clickhouse_native/patches/`. Nested occurrences (`Array(Bool)`, `Map(_, Bool)`, `Tuple(..., Bool, ...)`) are decoded as their underlying `UInt8`.
 
@@ -288,6 +291,7 @@ Integer and Float values render bare (`SET allow_experimental_analyzer = 1`); an
 - `Date` / `Time` / `String` / `Integer` epoch are accepted for `Date` / `Date32`; only the calendar day is stored.
 - `nil` on a non-`Nullable` column is silently coerced to the column's default (zero / empty string / empty array) — mirrors the HTTP gem's `JSONEachRow` behaviour. For strict semantics, use a `Nullable(T)` column.
 - `LowCardinality(String)` and `LowCardinality(Nullable(String))` inserts are supported. Numeric `LowCardinality` dictionaries are not.
+- `JSON` columns accept a `Hash` / `Array` (serialized with `#to_json`) or a `String` (used verbatim as JSON text). `nil` becomes `{}` — an empty JSON object, since ClickHouse rejects empty strings — or SQL `NULL` on a `Nullable(JSON)` column. Creating a `JSON` column needs `enable_json_type = 1` on the `CREATE TABLE` (pass it via `execute(sql, settings: { enable_json_type: 1 })`); inserting the data does not.
 - `Map`, arbitrary `Tuple`, and other structural types are not yet supported for `#insert` — they decode fine, but inserting raises `EncoderError`.
 
 ## Errors

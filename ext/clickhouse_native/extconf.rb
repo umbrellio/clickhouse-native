@@ -97,6 +97,10 @@ configure_args = [
   "-DBUILD_BENCHMARK=OFF",
   "-DBUILD_TESTS=OFF",
   "-DWITH_OPENSSL=OFF",
+  # clickhouse-cpp v2.6.2 added a distinct Bool column; this gem relies on
+  # Bool normalising to UInt8 (see the declared-type handling in client.cpp).
+  # Pin the upstream default ON so a future default flip can't break us.
+  "-DCH_MAP_BOOL_TO_UINT8=ON",
   "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
   "-DCMAKE_BUILD_TYPE=Release"
 ]
