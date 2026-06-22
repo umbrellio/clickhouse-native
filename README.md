@@ -292,7 +292,7 @@ Integer and Float values render bare (`SET allow_experimental_analyzer = 1`); an
 - `nil` on a non-`Nullable` column is silently coerced to the column's default (zero / empty string / empty array) — mirrors the HTTP gem's `JSONEachRow` behaviour. For strict semantics, use a `Nullable(T)` column.
 - `LowCardinality(String)` and `LowCardinality(Nullable(String))` inserts are supported. Numeric `LowCardinality` dictionaries are not.
 - `JSON` columns accept a `Hash` / `Array` (serialized with `#to_json`) or a `String` (used verbatim as JSON text). `nil` becomes `{}` — an empty JSON object, since ClickHouse rejects empty strings — or SQL `NULL` on a `Nullable(JSON)` column. Creating a `JSON` column needs `enable_json_type = 1` on the `CREATE TABLE` (pass it via `execute(sql, settings: { enable_json_type: 1 })`); inserting the data does not.
-- `Map`, arbitrary `Tuple`, and other structural types are not yet supported for `#insert` — they decode fine, but inserting raises `EncoderError`.
+- Arbitrary `Tuple` and other structural types are not yet supported for `#insert` — they decode fine, but inserting raises `EncoderError`.
 
 ## Errors
 
