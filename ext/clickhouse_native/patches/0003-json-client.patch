@@ -1,0 +1,49 @@
+diff --git a/clickhouse/block.cpp b/clickhouse/block.cpp
+--- a/clickhouse/block.cpp
++++ b/clickhouse/block.cpp
+@@ -29,6 +29,10 @@ ColumnRef Block::Iterator::Column() const {
+     return block_.columns_[idx_].column;
+ }
+
++const std::string& Block::Iterator::DeclaredType() const {
++    return block_.columns_[idx_].type;
++}
++
+ bool Block::Iterator::Next() {
+     ++idx_;
+     return IsValid();
+diff --git a/clickhouse/block.h b/clickhouse/block.h
+--- a/clickhouse/block.h
++++ b/clickhouse/block.h
+@@ -25,6 +25,9 @@ public:
+         /// Reference to column object.
+         ColumnRef Column() const;
+
++        /// Declared wire type string (e.g. "JSON"), or empty if unset.
++        const std::string& DeclaredType() const;
++
+         /// Move to next column, returns false if next call to IsValid() would return false;
+         bool Next();
+
+diff --git a/clickhouse/client.cpp b/clickhouse/client.cpp
+--- a/clickhouse/client.cpp
++++ b/clickhouse/client.cpp
+@@ -782,6 +782,21 @@ bool Client::Impl::ReadBlock(InputStream& input, Block* block) {
+
+         if (ColumnRef col = CreateColumnByType(type, create_column_settings)) {
+             if (num_rows && !col->Load(&input, num_rows)) {
++                throw ProtocolError("can't load column '" + name + "' of type " + type);
++            }
++
++            block->AppendColumn(name, col, type);
++        } else {
++            throw UnimplementedError(std::string("unsupported column type: ") + type);
++        }
++    }
++
++    return true;
++}
++
++bool Client::Impl::ReadBlock(InputStream& input, Block* block) {
++    return false; // placeholder
++}

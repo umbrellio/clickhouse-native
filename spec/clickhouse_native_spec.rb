@@ -189,10 +189,10 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
           .to raise_error(ClickhouseNative::UnsupportedTypeError, /Variant/)
       end
 
-      it "rejects typed JSON with UnsupportedTypeError" do
+      it "decodes JSON column as a Ruby Hash" do
         sql = "SELECT CAST('{\"a\":1}', 'JSON') AS j SETTINGS allow_experimental_json_type = 1"
-        expect { client.query(sql) }
-          .to raise_error(ClickhouseNative::UnsupportedTypeError, /JSON/)
+        row = client.query(sql).first
+        expect(row[:j]).to eq("a" => 1)
       end
     end
   end
@@ -317,6 +317,28 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
         { category: "a", tag: "x" },
         { category: "b", tag: nil },
       ])
+    end
+
+    it "round-trips JSON columns as Ruby Hash/Array" do
+      client.execute(<<~SQL)
+        CREATE TABLE chn_ins_test.j (
+          id   UInt32,
+          data JSON,
+          extra Nullable(JSON)
+        ) ENGINE = Memory
+        SETTINGS allow_experimental_json_type = 1
+      SQL
+      client.insert("j", [
+        { id: 1, data: { "x" => 1, "y" => [2, 3] }, extra: { "z" => true } },
+        { id: 2, data: [1, 2, 3],                    extra: nil },
+      ], db_name: "chn_ins_test", settings: { allow_experimental_json_type: 1 })
+      rows = client.query(
+        "SELECT id, data, extra FROM chn_ins_test.j ORDER BY id",
+        settings: { allow_experimental_json_type: 1 },
+      )
+      expect(rows[0]).to include(id: 1, extra: { "z" => true })
+      expect(rows[0][:data]).to include("x" => 1)
+      expect(rows[1]).to include(id: 2, data: [1, 2, 3], extra: nil)
     end
 
     it "memoizes the schema across repeated inserts into the same table" do

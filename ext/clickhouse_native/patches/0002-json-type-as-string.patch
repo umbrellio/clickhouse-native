@@ -1,0 +1,9 @@
+diff --git a/clickhouse/types/type_parser.cpp b/clickhouse/types/type_parser.cpp
+--- a/clickhouse/types/type_parser.cpp
++++ b/clickhouse/types/type_parser.cpp
+@@ -67,6 +67,8 @@ static const std::unordered_map<std::string, Type::Code> kTypeCode = {
+     { "Time",        Type::Time },
+     { "Time64",      Type::Time64 },
++    // JSON wire format is length-prefixed UTF-8, identical to String.
++    { "JSON",        Type::String },
+ };

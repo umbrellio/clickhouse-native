@@ -27,6 +27,7 @@ using namespace clickhouse;
 
 static VALUE rb_mClickhouseNative;
 static VALUE rb_cClient;
+static VALUE rb_mJSON = Qnil;
 
 static VALUE err_base, err_connection, err_timeout, err_protocol,
              err_server, err_encoder, err_decoder, err_unsupported;
@@ -115,6 +116,18 @@ static VALUE value_at(const ColumnRef& col, size_t idx, const std::string& decla
         auto n = col->As<ColumnNullable>();
         if (n->IsNull(idx)) return Qnil;
         return n->Nested()->As<ColumnUInt8>()->At(idx) ? Qtrue : Qfalse;
+    }
+    if (declared_type == "JSON") {
+        auto sv = col->As<ColumnString>()->At(idx);
+        VALUE json_str = rb_utf8_str_new(sv.data(), sv.size());
+        return rb_funcall(rb_mJSON, rb_intern("parse"), 1, json_str);
+    }
+    if (declared_type == "Nullable(JSON)") {
+        auto n = col->As<ColumnNullable>();
+        if (n->IsNull(idx)) return Qnil;
+        auto sv = n->Nested()->As<ColumnString>()->At(idx);
+        VALUE json_str = rb_utf8_str_new(sv.data(), sv.size());
+        return rb_funcall(rb_mJSON, rb_intern("parse"), 1, json_str);
     }
 
     auto type = col->Type();
@@ -901,6 +914,18 @@ struct InsertNoGVL {
 };
 }  // namespace
 
+// Serialize a Ruby value as a JSON string for insertion into a JSON column.
+// Strings are passed through as-is (assumed to be valid JSON already).
+// All other types (Hash, Array, nil, numerics, booleans) are encoded via
+// JSON.dump, which accepts all Ruby types including nil.
+static VALUE to_json_string(VALUE val) {
+    if (RB_TYPE_P(val, T_STRING)) {
+        StringValue(val);
+        return val;
+    }
+    return rb_funcall(rb_mJSON, rb_intern("dump"), 1, val);
+}
+
 static void* insert_no_gvl(void* data) {
     auto* a = static_cast<InsertNoGVL*>(data);
     try {
@@ -931,8 +956,10 @@ static VALUE ch_client_insert_block(VALUE self, VALUE rb_table, VALUE rb_columns
         std::string table(RSTRING_PTR(rb_table), RSTRING_LEN(rb_table));
         std::vector<std::string> names;
         std::vector<ColumnRef> cols;
+        std::vector<std::string> type_strs;
         names.reserve(ncols);
         cols.reserve(ncols);
+        type_strs.reserve(ncols);
         for (long i = 0; i < ncols; i++) {
             VALUE pair = rb_ary_entry(rb_columns, i);
             Check_Type(pair, T_ARRAY);
@@ -942,6 +969,7 @@ static VALUE ch_client_insert_block(VALUE self, VALUE rb_table, VALUE rb_columns
             StringValue(rb_type);
             names.emplace_back(RSTRING_PTR(rb_name), RSTRING_LEN(rb_name));
             std::string type_str(RSTRING_PTR(rb_type), RSTRING_LEN(rb_type));
+            type_strs.push_back(type_str);
             auto ch_col = CreateColumnByType(type_str);
             if (!ch_col) {
                 throw chn::EncoderFailure("unknown column type " + type_str + " for " + names.back());
@@ -961,7 +989,17 @@ static VALUE ch_client_insert_block(VALUE self, VALUE rb_table, VALUE rb_columns
                 throw chn::EncoderFailure(msg);
             }
             for (long cc = 0; cc < ncols; cc++) {
-                append_value(cols[cc], rb_ary_entry(row, cc));
+                VALUE cell = rb_ary_entry(row, cc);
+                const auto& dt = type_strs[cc];
+                // For JSON columns, serialize Hash/Array/nil/etc. to JSON
+                // string. Nullable(JSON): skip nil so the Nullable handler
+                // sets the SQL-null flag rather than storing "null" string.
+                if (dt == "JSON") {
+                    cell = to_json_string(cell);
+                } else if (dt == "Nullable(JSON)" && !NIL_P(cell)) {
+                    cell = to_json_string(cell);
+                }
+                append_value(cols[cc], cell);
             }
         }
 
@@ -1160,6 +1198,10 @@ static VALUE ch_client_close(VALUE self) {
 
 extern "C" void Init_clickhouse_native(void) {
     rb_mClickhouseNative = rb_define_module("ClickhouseNative");
+
+    rb_require("json");
+    rb_mJSON = rb_const_get(rb_cObject, rb_intern("JSON"));
+    rb_global_variable(&rb_mJSON);
 
     err_base        = rb_const_get(rb_mClickhouseNative, rb_intern("Error"));
     err_connection  = rb_const_get(rb_mClickhouseNative, rb_intern("ConnectionError"));
