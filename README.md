@@ -36,6 +36,16 @@ sudo apt-get install -y cmake build-essential
 apk add --no-cache cmake build-base linux-headers
 ```
 
+### Installing from a git source
+
+The vendored clickhouse-cpp lives in a git submodule. Bundler does **not** fetch submodules for `git:` dependencies unless you add `submodules: true`:
+
+```ruby
+gem "clickhouse-native", git: "https://github.com/umbrellio/clickhouse-native.git", submodules: true
+```
+
+(Without it the build aborts with "clickhouse-cpp submodule not found"; `extconf.rb` will try to fetch it for you when run inside a git checkout, but `submodules: true` is the reliable way.)
+
 ## Quick start
 
 ```ruby

@@ -22,16 +22,39 @@ def fatal(msg)
   abort "clickhouse-native: cannot build extension"
 end
 
+# Bundler `git:` installs don't fetch submodules unless the Gemfile sets
+# `submodules: true`, which leaves vendor/clickhouse-cpp empty. When we're
+# sitting in a git checkout, fetch it ourselves so the build can proceed
+# without every consumer having to remember that flag. Released gems and
+# `submodules: recursive` checkouts already have the tree, so this is a no-op
+# there.
+unless File.exist?(File.join(VENDOR, "CMakeLists.txt"))
+  in_git_checkout = system(
+    "git", "-C", EXT_DIR, "rev-parse", "--is-inside-work-tree",
+    out: File::NULL, err: File::NULL
+  )
+  if in_git_checkout
+    warn "clickhouse-native: vendored clickhouse-cpp is missing; " \
+         "running `git submodule update --init --recursive`…"
+    system("git", "-C", EXT_DIR, "submodule", "update", "--init", "--recursive")
+  end
+end
+
 unless File.exist?(File.join(VENDOR, "CMakeLists.txt"))
   fatal <<~MSG
     clickhouse-cpp submodule not found at:
       #{VENDOR}
 
-    If you cloned this gem's repo, run:
+    Installing from a git source? Bundler skips submodules unless you add
+    `submodules: true` to the gem line:
+
+      gem "clickhouse-native", git: "...", submodules: true
+
+    From a manual clone, run:
       git submodule update --init --recursive
 
-    If you see this during `gem install`, please report a bug — the
-    gemspec should have bundled the submodule tree.
+    If you see this while installing a released gem from RubyGems, please
+    report a bug — the published .gem should bundle the submodule tree.
   MSG
 end
 
