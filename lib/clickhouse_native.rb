@@ -3,6 +3,7 @@
 require "time"
 require "date"
 require "bigdecimal"
+require "json"
 require "clickhouse_native/version"
 require "clickhouse_native/errors"
 

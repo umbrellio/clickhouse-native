@@ -7,6 +7,7 @@
 #include <clickhouse/columns/decimal.h>
 #include <clickhouse/columns/enum.h>
 #include <clickhouse/columns/factory.h>
+#include <clickhouse/columns/json.h>
 #include <clickhouse/columns/lowcardinality.h>
 #include <clickhouse/columns/map.h>
 #include <clickhouse/columns/numeric.h>
@@ -188,6 +189,17 @@ static VALUE value_at(const ColumnRef& col, size_t idx, const std::string& decla
             return rb_utf8_str_new(sv.data(), sv.size());
         }
 
+        case Type::JSON: {
+            // clickhouse-cpp's ColumnJSON is string-backed (it relies on the
+            // server's output_format_native_write_json_as_string). Decode the
+            // raw JSON text into a Ruby object so a JSON column reads back like
+            // Map does — a Hash — rather than a string the caller must re-parse.
+            auto sv = col->As<ColumnJSON>()->At(idx);
+            VALUE str = rb_utf8_str_new(sv.data(), sv.size());
+            VALUE rb_mJSON = rb_const_get(rb_cObject, rb_intern("JSON"));
+            return rb_funcall(rb_mJSON, rb_intern("parse"), 1, str);
+        }
+
         case Type::Date: {
             // Return a Ruby Date so as_json/to_s gives "YYYY-MM-DD" instead of
             // a full ISO8601 timestamp. CH Date is days since 1970-01-01 UTC.
@@ -327,6 +339,8 @@ static void append_default(const ColumnRef& col) {
         case Type::Float64: col->As<ColumnFloat64>()->Append(0); return;
         case Type::String:      col->As<ColumnString>()->Append(std::string_view()); return;
         case Type::FixedString: col->As<ColumnFixedString>()->Append(std::string_view()); return;
+        // CH rejects an empty string as JSON; the empty value is "{}".
+        case Type::JSON:        col->As<ColumnJSON>()->Append(std::string_view("{}")); return;
         case Type::Date:        col->As<ColumnDate>()->Append(0); return;
         case Type::Date32:      col->As<ColumnDate32>()->Append(0); return;
         case Type::DateTime:    col->As<ColumnDateTime>()->Append(0); return;
@@ -487,6 +501,19 @@ static void append_value(const ColumnRef& col, VALUE value) {
             StringValue(value);
             col->As<ColumnFixedString>()->Append(
                 std::string_view(RSTRING_PTR(value), RSTRING_LEN(value)));
+            return;
+        }
+
+        case Type::JSON: {
+            // A String is taken as already-serialized JSON text and passed
+            // through verbatim; anything else (Hash / Array / ...) is rendered
+            // via #to_json. nil is handled earlier via append_default ("{}").
+            VALUE str = RB_TYPE_P(value, T_STRING)
+                ? value
+                : rb_funcall(value, rb_intern("to_json"), 0);
+            StringValue(str);
+            col->As<ColumnJSON>()->Append(
+                std::string_view(RSTRING_PTR(str), RSTRING_LEN(str)));
             return;
         }
 
@@ -726,6 +753,18 @@ static void apply_settings(Query& q, VALUE kwargs) {
     rb_hash_foreach(settings, apply_settings_cb, reinterpret_cast<VALUE>(&q));
 }
 
+// Same as apply_settings, but first defaults
+// output_format_native_write_json_as_string=1 so JSON columns come back as
+// strings (clickhouse-cpp's ColumnJSON can only read them that way). The flag
+// is 0 (not "important"), so servers that don't know the setting ignore it
+// instead of erroring. User-supplied settings are applied afterwards and win,
+// so callers can still override it.
+static void apply_read_settings(Query& q, VALUE kwargs) {
+    q.SetSetting("output_format_native_write_json_as_string",
+                 QuerySettingsField{"1", 0});
+    apply_settings(q, kwargs);
+}
+
 // Client.new(host:, port:, database:, user:, password:)
 static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
     VALUE kwargs = Qnil;
@@ -827,7 +866,7 @@ static VALUE ch_client_query(int argc, VALUE* argv, VALUE self) {
     try {
         std::vector<ID> col_ids;
         Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
-        apply_settings(q, kwargs);
+        apply_read_settings(q, kwargs);
         q.OnData([&](const Block& block) {
             size_t ncols = block.GetColumnCount();
             size_t nrows = block.GetRowCount();
@@ -872,7 +911,7 @@ static VALUE ch_client_query_value(int argc, VALUE* argv, VALUE self) {
         VALUE out = Qnil;
         bool seen = false;
         Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
-        apply_settings(q, kwargs);
+        apply_read_settings(q, kwargs);
         q.OnData([&](const Block& block) {
             if (seen) return;
             if (block.GetRowCount() == 0 || block.GetColumnCount() == 0) return;
@@ -1071,7 +1110,7 @@ static VALUE ch_client_query_each(int argc, VALUE* argv, VALUE self) {
 
     QueryEachState state{rb_block_proc(), {}, 0, false};
     Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
-    apply_settings(q, kwargs);
+    apply_read_settings(q, kwargs);
     q.OnDataCancelable([&state](const Block& block) -> bool {
         if (state.aborted) return false;
         YieldBlockArgs ya{&block, &state};
