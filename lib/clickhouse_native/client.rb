@@ -2,7 +2,7 @@
 
 module ClickhouseNative
   class Client
-    attr_reader :host, :port, :database
+    attr_reader :host, :port, :database, :ping_before_query, :tcp_keepalive, :retry_timeout
 
     def describe_table(table, db_name: nil)
       fq = db_name ? "#{db_name}.#{table}" : table

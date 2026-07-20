@@ -618,7 +618,7 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       expect(p.query_value("SELECT getSetting('max_threads')")).to eq(7)
     end
 
-    it "applies multiple settings in one SET" do
+    it "applies multiple settings" do
       p = described_class.new(
         **CH_KWARGS,
         pool_size: 2,
@@ -628,7 +628,7 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       expect(p.query_value("SELECT getSetting('max_execution_time')")).to eq(42)
     end
 
-    it "quotes non-numeric values as SQL strings" do
+    it "applies string-valued settings" do
       p = described_class.new(
         **CH_KWARGS,
         pool_size: 1,
@@ -647,20 +647,18 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       expect(results).to all(eq(11))
     end
 
-    it "surfaces invalid setting names as ServerError at pool construction" do
-      expect do
-        described_class.new(**CH_KWARGS, pool_size: 1, settings: { no_such_setting: 1 })
-          .ping
-      end.to raise_error(ClickhouseNative::ServerError, /setting/i)
+    it "surfaces invalid setting names as ServerError on query" do
+      # Settings ride each query as important per-query settings, so an
+      # unknown name errors on use (rather than being silently ignored).
+      p = described_class.new(**CH_KWARGS, pool_size: 1, settings: { no_such_setting: 1 })
+      expect { p.query_value("SELECT 1") }
+        .to raise_error(ClickhouseNative::ServerError, /setting/i)
     end
 
-    # Regression: a client whose query raised must not be reused. Reusing
-    # it surfaces buffered protocol errors from the aborted operation on
-    # the next send, attributing them to unrelated SQL (in particular the
-    # session-settings SET we'd otherwise re-run). Discarding + replacing
-    # is the safe path; the fresh client also gets settings re-applied by
-    # the pool builder, so end-to-end behavior stays intact.
-    it "re-applies settings on the next checkout after a query raised" do
+    # A client whose query raised must not be reused: its socket may be
+    # mid-packet. The pool discards + replaces it; because settings ride
+    # every query, the replacement still applies them.
+    it "still applies settings on the next checkout after a query raised" do
       p = described_class.new(**CH_KWARGS, pool_size: 1, settings: { max_threads: 5 })
       expect(p.query_value("SELECT getSetting('max_threads')")).to eq(5)
 
@@ -668,6 +666,42 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
         .to raise_error(ClickhouseNative::ServerError)
 
       expect(p.query_value("SELECT getSetting('max_threads')")).to eq(5)
+    end
+
+    # The regression this PR's per-query-settings change guards against: a
+    # transparent ping_before_query reconnect must not drop session settings.
+    it "keeps settings across a transparent reconnect" do
+      proxy = TcpProxy.new(upstream_host: CH_HOST, upstream_port: CH_PORT).start
+      pool = described_class.new(
+        host: "127.0.0.1", port: proxy.port, pool_size: 1,
+        settings: { max_threads: 7 }, retry_timeout: 0
+      )
+      expect(pool.query_value("SELECT getSetting('max_threads')")).to eq(7)
+
+      proxy.sever_all
+
+      expect(pool.query_value("SELECT getSetting('max_threads')")).to eq(7)
+    ensure
+      proxy&.stop
+    end
+
+    # Regression: pool settings must reach block inserts, not just queries.
+    # An unknown setting rides the generated INSERT as important, so the
+    # server rejects it — if settings were dropped on insert, it would succeed.
+    it "carries pool settings into inserts" do
+      ddl = ClickhouseNative::Client.new(**CH_KWARGS)
+      ddl.execute("DROP TABLE IF EXISTS chn_insert_settings")
+      ddl.execute("CREATE TABLE chn_insert_settings (id UInt64) ENGINE = Memory")
+      ddl.close
+
+      # columns/types are passed so no DESCRIBE query runs before the insert.
+      pool = described_class.new(**CH_KWARGS, pool_size: 1, settings: { no_such_setting: 1 })
+      expect { pool.insert("chn_insert_settings", [[1]], columns: ["id"], types: ["UInt64"]) }
+        .to raise_error(ClickhouseNative::ServerError, /setting/i)
+    ensure
+      cleanup = ClickhouseNative::Client.new(**CH_KWARGS)
+      cleanup.execute("DROP TABLE IF EXISTS chn_insert_settings")
+      cleanup.close
     end
   end
 
@@ -681,6 +715,78 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
 
       expect { captured.ping }.to raise_error(ClickhouseNative::ConnectionError, /closed/)
       expect(p.ping).to be(true)
+    end
+  end
+end
+
+RSpec.describe "connection resilience", :clickhouse do
+  describe "options on Client" do
+    it "defaults ping_before_query and tcp_keepalive on, retry_timeout to 1s" do
+      client = ClickhouseNative::Client.new(**CH_KWARGS)
+      expect(client.ping_before_query).to be(true)
+      expect(client.tcp_keepalive).to be(true)
+      expect(client.retry_timeout).to eq(1)
+      client.close
+    end
+
+    it "honors explicit overrides" do
+      client = ClickhouseNative::Client.new(
+        **CH_KWARGS, ping_before_query: false, tcp_keepalive: false, retry_timeout: 4,
+      )
+      expect(client.ping_before_query).to be(false)
+      expect(client.tcp_keepalive).to be(false)
+      expect(client.retry_timeout).to eq(4)
+      client.close
+    end
+  end
+
+  describe "options on Pool" do
+    it "forwards them to checked-out clients" do
+      pool = ClickhouseNative::Pool.new(
+        **CH_KWARGS, pool_size: 1, ping_before_query: false, retry_timeout: 2,
+      )
+      pool.with do |client|
+        expect(client.ping_before_query).to be(false)
+        expect(client.retry_timeout).to eq(2)
+      end
+    end
+
+    it "defaults its clients to ping_before_query on" do
+      pool = ClickhouseNative::Pool.new(**CH_KWARGS, pool_size: 1)
+      pool.with { |client| expect(client.ping_before_query).to be(true) }
+    end
+  end
+
+  # A server / LB silently closing an idle pooled connection is the root cause
+  # of the "closed: ..." ConnectionError this option set defends against.
+  describe "stale-connection recovery" do
+    let(:proxy) { TcpProxy.new(upstream_host: CH_HOST, upstream_port: CH_PORT).start }
+
+    after { proxy.stop }
+
+    it "transparently reconnects when the server dropped the connection" do
+      client = ClickhouseNative::Client.new(
+        host: "127.0.0.1", port: proxy.port, ping_before_query: true, retry_timeout: 0,
+      )
+      expect(client.query_value("SELECT 1")).to eq(1)
+
+      proxy.sever_all
+
+      expect(client.query_value("SELECT 2")).to eq(2)
+      client.close
+    end
+
+    it "raises ConnectionError on a dropped connection with ping_before_query off" do
+      client = ClickhouseNative::Client.new(
+        host: "127.0.0.1", port: proxy.port, ping_before_query: false,
+      )
+      expect(client.query_value("SELECT 1")).to eq(1)
+
+      proxy.sever_all
+
+      expect { client.query_value("SELECT 2") }
+        .to raise_error(ClickhouseNative::ConnectionError)
+      client.close
     end
   end
 end
