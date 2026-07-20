@@ -264,7 +264,7 @@ end
 
 ### Session settings
 
-Pass `settings:` to `Pool.new` to apply ClickHouse session settings to every client the pool creates. Each checked-out connection starts from the same session state — equivalent to sending `?key=value` URL params on every HTTP request.
+Pass `settings:` to `Pool.new` to apply ClickHouse settings to every query the pool runs — equivalent to sending `?key=value` URL params on every HTTP request. They ride each query as per-query settings rather than a one-time session `SET`, so they survive a transparent [reconnect](#connection-resilience) instead of reverting to server defaults on the new socket.
 
 ```ruby
 pool = ClickhouseNative::Pool.new(
@@ -277,7 +277,7 @@ pool = ClickhouseNative::Pool.new(
 )
 ```
 
-Integer and Float values render bare (`SET allow_experimental_analyzer = 1`); anything else is quoted as a SQL string literal.
+An unknown setting name is rejected by the server (the settings are sent as important), so a typo fails loudly rather than being silently ignored. A per-call `settings:` on an individual `#query` / `#execute` overrides the pool default for that query.
 
 ## Type mapping
 

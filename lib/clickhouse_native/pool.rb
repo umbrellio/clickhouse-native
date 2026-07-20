@@ -14,14 +14,11 @@ module ClickhouseNative
       @port = port
       @database = database
       client_kwargs = {
-        host:, port:, database:, user:, password:, compression:, logger:,
+        host:, port:, database:, user:, password:, compression:, logger:, settings:,
         ping_before_query:, tcp_keepalive:, retry_timeout:
       }
-      @set_sql = settings_sql(settings)
       @pool = ConnectionPool.new(size: pool_size, timeout: pool_timeout) do
-        client = Client.new(**client_kwargs)
-        client.execute(@set_sql) if @set_sql
-        client
+        Client.new(**client_kwargs)
       end
     end
 
@@ -29,10 +26,9 @@ module ClickhouseNative
     # path leaves the socket in an unknown state. The C++ binding issues
     # ResetConnection, but a subsequent send can still surface buffered
     # protocol errors from the prior aborted operation — those get
-    # attributed to whatever SQL we tried next (e.g. the SET reapplying
-    # session settings), producing misleading log lines and re-raises in
-    # unrelated code. A fresh socket + handshake is cheap relative to
-    # debugging that.
+    # attributed to whatever SQL we tried next, producing misleading log
+    # lines and re-raises in unrelated code. A fresh socket + handshake is
+    # cheap relative to debugging that.
     #
     # ConnectionError gets one automatic retry: pooled connections that
     # have been idle long enough for the server / an LB to FIN them
@@ -94,22 +90,6 @@ module ClickhouseNative
 
     def describe_table(table, db_name: nil)
       with { |c| c.describe_table(table, db_name:) }
-    end
-
-    private
-
-    # Render a `SET key1 = val1, key2 = val2` statement once at pool setup
-    # so every checked-out connection starts with the same session
-    # settings. Matches how the HTTP driver injected global_params per
-    # request. Values: Integer / Float render bare; anything else is
-    # quoted as a SQL string literal.
-    def settings_sql(settings)
-      return nil if settings.nil? || settings.empty?
-      parts = settings.map do |k, v|
-        literal = v.is_a?(Numeric) ? v.to_s : "'#{v.to_s.gsub("'", "''")}'"
-        "#{k} = #{literal}"
-      end
-      "SET #{parts.join(', ')}"
     end
   end
 end

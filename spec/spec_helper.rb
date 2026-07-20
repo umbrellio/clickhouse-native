@@ -24,7 +24,10 @@ CH_JSON_ENABLE = { allow_experimental_json_type: 1, enable_json_type: 1 }.freeze
 # The accept/tunnel loop runs in a CHILD PROCESS: Client#initialize does its
 # connect+handshake without releasing the GVL, so an in-process accept thread
 # could never run and the very first connect would deadlock. A separate process
-# has its own GVL. #sever_all signals the child (SIGUSR1) to drop live tunnels.
+# has its own GVL. #sever_all signals the child (SIGUSR1) to drop live tunnels
+# and blocks on a pipe ack until the child has actually closed them — otherwise
+# the caller could race ahead and query the still-live socket, so a reconnect
+# would never be exercised.
 class TcpProxy
   attr_reader :port
 
@@ -33,10 +36,12 @@ class TcpProxy
     @upstream_port = upstream_port
     @server = TCPServer.new("127.0.0.1", 0)
     @port = @server.addr[1]
+    @ack_read, @ack_write = IO.pipe
   end
 
   def start
     @pid = fork do
+      @ack_read.close
       run_child
     rescue Exception # rubocop:disable Lint/RescueException
       nil
@@ -44,11 +49,13 @@ class TcpProxy
       exit!(0) # never fall back into the RSpec process
     end
     @server.close
+    @ack_write.close # only the child writes acks
     self
   end
 
   def sever_all
     Process.kill("USR1", @pid)
+    @ack_read.read(1) # block until the child confirms the tunnels are closed
   end
 
   def stop
@@ -56,6 +63,8 @@ class TcpProxy
     Process.wait(@pid)
   rescue Errno::ESRCH, Errno::ECHILD
     nil
+  ensure
+    @ack_read.close
   end
 
   private
@@ -71,6 +80,7 @@ class TcpProxy
         close(a)
         close(b)
       end
+      @ack_write.write(".") # tell sever_all the tunnels are down
     end
     loop do
       downstream = @server.accept

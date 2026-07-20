@@ -618,7 +618,7 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       expect(p.query_value("SELECT getSetting('max_threads')")).to eq(7)
     end
 
-    it "applies multiple settings in one SET" do
+    it "applies multiple settings" do
       p = described_class.new(
         **CH_KWARGS,
         pool_size: 2,
@@ -628,7 +628,7 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       expect(p.query_value("SELECT getSetting('max_execution_time')")).to eq(42)
     end
 
-    it "quotes non-numeric values as SQL strings" do
+    it "applies string-valued settings" do
       p = described_class.new(
         **CH_KWARGS,
         pool_size: 1,
@@ -647,20 +647,18 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       expect(results).to all(eq(11))
     end
 
-    it "surfaces invalid setting names as ServerError at pool construction" do
-      expect do
-        described_class.new(**CH_KWARGS, pool_size: 1, settings: { no_such_setting: 1 })
-          .ping
-      end.to raise_error(ClickhouseNative::ServerError, /setting/i)
+    it "surfaces invalid setting names as ServerError on query" do
+      # Settings ride each query as important per-query settings, so an
+      # unknown name errors on use (rather than being silently ignored).
+      p = described_class.new(**CH_KWARGS, pool_size: 1, settings: { no_such_setting: 1 })
+      expect { p.query_value("SELECT 1") }
+        .to raise_error(ClickhouseNative::ServerError, /setting/i)
     end
 
-    # Regression: a client whose query raised must not be reused. Reusing
-    # it surfaces buffered protocol errors from the aborted operation on
-    # the next send, attributing them to unrelated SQL (in particular the
-    # session-settings SET we'd otherwise re-run). Discarding + replacing
-    # is the safe path; the fresh client also gets settings re-applied by
-    # the pool builder, so end-to-end behavior stays intact.
-    it "re-applies settings on the next checkout after a query raised" do
+    # A client whose query raised must not be reused: its socket may be
+    # mid-packet. The pool discards + replaces it; because settings ride
+    # every query, the replacement still applies them.
+    it "still applies settings on the next checkout after a query raised" do
       p = described_class.new(**CH_KWARGS, pool_size: 1, settings: { max_threads: 5 })
       expect(p.query_value("SELECT getSetting('max_threads')")).to eq(5)
 
@@ -668,6 +666,23 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
         .to raise_error(ClickhouseNative::ServerError)
 
       expect(p.query_value("SELECT getSetting('max_threads')")).to eq(5)
+    end
+
+    # The regression this PR's per-query-settings change guards against: a
+    # transparent ping_before_query reconnect must not drop session settings.
+    it "keeps settings across a transparent reconnect" do
+      proxy = TcpProxy.new(upstream_host: CH_HOST, upstream_port: CH_PORT).start
+      pool = described_class.new(
+        host: "127.0.0.1", port: proxy.port, pool_size: 1,
+        settings: { max_threads: 7 }, retry_timeout: 0
+      )
+      expect(pool.query_value("SELECT getSetting('max_threads')")).to eq(7)
+
+      proxy.sever_all
+
+      expect(pool.query_value("SELECT getSetting('max_threads')")).to eq(7)
+    ensure
+      proxy&.stop
     end
   end
 

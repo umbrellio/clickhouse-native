@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 using namespace clickhouse;
@@ -667,6 +668,11 @@ static void append_value(const ColumnRef& col, VALUE value) {
 
 struct CHClient {
     std::unique_ptr<Client> client;
+    // Session settings applied to *every* query as per-query settings, rather
+    // than a one-time session `SET`. Per-query settings ride each query packet,
+    // so they survive a transparent ping_before_query reconnect (a fresh socket
+    // would otherwise lose a session-level SET and fall back to server defaults).
+    std::vector<std::pair<std::string, std::string>> default_settings;
 };
 
 static void ch_client_free(void* p) {
@@ -755,6 +761,16 @@ static int apply_settings_cb(VALUE key, VALUE val, VALUE arg) {
     return ST_CONTINUE;
 }
 
+// Collect a `settings:` Hash into a client's default_settings vector at
+// construction. Values are stringified the same way per-query settings are.
+static int collect_setting_cb(VALUE key, VALUE val, VALUE arg) {
+    auto* vec = reinterpret_cast<std::vector<std::pair<std::string, std::string>>*>(arg);
+    VALUE k = SYMBOL_P(key) ? rb_sym2str(key) : key;
+    StringValue(k);
+    vec->emplace_back(std::string(RSTRING_PTR(k), RSTRING_LEN(k)), stringify_setting_value(val));
+    return ST_CONTINUE;
+}
+
 // Read a `settings:` Hash out of the parsed kwargs and stamp each entry
 // onto `q` as a per-query setting. No-op if kwargs is nil or settings is
 // missing/empty. Raises TypeError if settings is not a Hash.
@@ -776,6 +792,16 @@ static void apply_read_settings(Query& q, VALUE kwargs) {
     q.SetSetting("output_format_native_write_json_as_string",
                  QuerySettingsField{"1", 0});
     apply_settings(q, kwargs);
+}
+
+// Stamp the client's construction-time `settings:` onto `q`. Marked important
+// (flag 1) so an unknown setting name errors — matching the old session `SET`,
+// which failed loudly instead of silently ignoring a typo'd setting. Applied
+// before per-call settings so an explicit `settings:` on the call still wins.
+static void apply_default_settings(Query& q, CHClient* c) {
+    for (const auto& kv : c->default_settings) {
+        q.SetSetting(kv.first, QuerySettingsField{kv.second, 1});
+    }
 }
 
 // Client.new(host:, port:, database:, user:, password:)
@@ -804,6 +830,14 @@ static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
     unsigned int retry_timeout = kwarg_uint(kwargs, "retry_timeout", 1);
 
     CHClient* c = as_client(self);
+
+    VALUE settings = rb_hash_lookup2(kwargs, ID2SYM(rb_intern("settings")), Qnil);
+    if (!NIL_P(settings)) {
+        Check_Type(settings, T_HASH);
+        rb_hash_foreach(settings, collect_setting_cb,
+                        reinterpret_cast<VALUE>(&c->default_settings));
+    }
+
     try {
         ClientOptions opts;
         opts.SetHost(host).SetPort(port)
@@ -866,6 +900,7 @@ static VALUE ch_client_execute(int argc, VALUE* argv, VALUE self) {
     if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
 
     Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
+    apply_default_settings(q, c);
     apply_settings(q, kwargs);
 
     ExecuteNoGVL args{c->client.get(), &q, nullptr};
@@ -897,6 +932,7 @@ static VALUE ch_client_query(int argc, VALUE* argv, VALUE self) {
     try {
         std::vector<ID> col_ids;
         Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
+        apply_default_settings(q, c);
         apply_read_settings(q, kwargs);
         q.OnData([&](const Block& block) {
             size_t ncols = block.GetColumnCount();
@@ -942,6 +978,7 @@ static VALUE ch_client_query_value(int argc, VALUE* argv, VALUE self) {
         VALUE out = Qnil;
         bool seen = false;
         Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
+        apply_default_settings(q, c);
         apply_read_settings(q, kwargs);
         q.OnData([&](const Block& block) {
             if (seen) return;
@@ -1141,6 +1178,7 @@ static VALUE ch_client_query_each(int argc, VALUE* argv, VALUE self) {
 
     QueryEachState state{rb_block_proc(), {}, 0, false};
     Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
+    apply_default_settings(q, c);
     apply_read_settings(q, kwargs);
     q.OnDataCancelable([&state](const Block& block) -> bool {
         if (state.aborted) return false;
