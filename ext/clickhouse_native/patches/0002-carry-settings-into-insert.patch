@@ -1,0 +1,82 @@
+diff --git a/clickhouse/client.cpp b/clickhouse/client.cpp
+index 34a733d..c9732f4 100644
+--- a/clickhouse/client.cpp
++++ b/clickhouse/client.cpp
+@@ -211,7 +211,8 @@ public:
+ 
+     bool IsSelecting() const { return state_ == State::Selecting; }
+ 
+-    void Insert(const std::string& table_name, const std::string& query_id, const Block& block);
++    void Insert(const std::string& table_name, const std::string& query_id, const Block& block,
++                const std::vector<std::pair<std::string, std::string>>& settings = {});
+ 
+     Block BeginInsert(Query query);
+ 
+@@ -485,7 +486,8 @@ std::string NameToQueryString(const std::string &input)
+     return output;
+ }
+ 
+-void Client::Impl::Insert(const std::string& table_name, const std::string& query_id, const Block& block) {
++void Client::Impl::Insert(const std::string& table_name, const std::string& query_id, const Block& block,
++                          const std::vector<std::pair<std::string, std::string>>& settings) {
+     if (state_ == State::Inserting) {
+         throw ValidationError("cannot execute query while inserting, use SendInsertData instead");
+     }
+@@ -511,6 +513,9 @@ void Client::Impl::Insert(const std::string& table_name, const std::string& quer
+     }
+ 
+     Query query("INSERT INTO " + table_name + " ( " + fields_section.str() + " ) VALUES", query_id);
++    for (const auto& kv : settings) {
++        query.SetSetting(kv.first, QuerySettingsField{kv.second, 1});
++    }
+     SendQuery(query);
+ 
+     // Wait for a data packet and return
+@@ -1365,12 +1370,14 @@ bool Client::IsSelecting() const
+     return impl_->IsSelecting();
+ }
+ 
+-void Client::Insert(const std::string& table_name, const Block& block) {
+-    impl_->Insert(table_name, Query::default_query_id, block);
++void Client::Insert(const std::string& table_name, const Block& block,
++                    const std::vector<std::pair<std::string, std::string>>& settings) {
++    impl_->Insert(table_name, Query::default_query_id, block, settings);
+ }
+ 
+-void Client::Insert(const std::string& table_name, const std::string& query_id, const Block& block) {
+-    impl_->Insert(table_name, query_id, block);
++void Client::Insert(const std::string& table_name, const std::string& query_id, const Block& block,
++                    const std::vector<std::pair<std::string, std::string>>& settings) {
++    impl_->Insert(table_name, query_id, block, settings);
+ }
+ 
+ Block Client::BeginInsert(const std::string& query) {
+diff --git a/clickhouse/client.h b/clickhouse/client.h
+index a55fd74..6c6ff53 100644
+--- a/clickhouse/client.h
++++ b/clickhouse/client.h
+@@ -23,6 +23,8 @@
+ #include "columns/bool.h"
+ 
+ #include <chrono>
++#include <utility>
++#include <vector>
+ #include <cstdint>
+ #include <memory>
+ #include <ostream>
+@@ -298,8 +300,13 @@ public:
+     bool IsSelecting() const;
+ 
+     /// Intends for insert block of data into a table \p table_name.
+-    void Insert(const std::string& table_name, const Block& block);
+-    void Insert(const std::string& table_name, const std::string& query_id, const Block& block);
++    /// \p settings are applied to the generated INSERT query as per-query
++    /// settings (patched-in for clickhouse-native: lets a pooled client carry
++    /// its session settings into inserts without a session-level SET).
++    void Insert(const std::string& table_name, const Block& block,
++                const std::vector<std::pair<std::string, std::string>>& settings = {});
++    void Insert(const std::string& table_name, const std::string& query_id, const Block& block,
++                const std::vector<std::pair<std::string, std::string>>& settings = {});
+ 
+     /// Start an \p INSERT statement, insert batches of data, then finish the insert.
+     Block BeginInsert(const std::string& query);

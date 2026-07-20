@@ -684,6 +684,25 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
     ensure
       proxy&.stop
     end
+
+    # Regression: pool settings must reach block inserts, not just queries.
+    # An unknown setting rides the generated INSERT as important, so the
+    # server rejects it — if settings were dropped on insert, it would succeed.
+    it "carries pool settings into inserts" do
+      ddl = ClickhouseNative::Client.new(**CH_KWARGS)
+      ddl.execute("DROP TABLE IF EXISTS chn_insert_settings")
+      ddl.execute("CREATE TABLE chn_insert_settings (id UInt64) ENGINE = Memory")
+      ddl.close
+
+      # columns/types are passed so no DESCRIBE query runs before the insert.
+      pool = described_class.new(**CH_KWARGS, pool_size: 1, settings: { no_such_setting: 1 })
+      expect { pool.insert("chn_insert_settings", [[1]], columns: ["id"], types: ["UInt64"]) }
+        .to raise_error(ClickhouseNative::ServerError, /setting/i)
+    ensure
+      cleanup = ClickhouseNative::Client.new(**CH_KWARGS)
+      cleanup.execute("DROP TABLE IF EXISTS chn_insert_settings")
+      cleanup.close
+    end
   end
 
   describe "discard-on-error" do

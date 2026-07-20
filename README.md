@@ -182,7 +182,7 @@ client.execute("OPTIMIZE TABLE events FINAL", settings: { mutations_sync: 2 })
 
 Keys may be Symbols or Strings. Values go through `#to_s` on the wire; `true` / `false` render as `"1"` / `"0"`. The same setting is also available pool-wide via `Pool.new(settings: ...)` for session-default values — per-call `settings:` is the right tool when only a specific query needs the override.
 
-`#insert` does not accept a `settings:` argument: clickhouse-cpp's block-insert API has no hook for per-request settings. For insert-time tuning, set the setting in the pool's session defaults, or use `#execute` to run an explicit `INSERT ... SETTINGS k=v VALUES ...` statement.
+`#insert` does not accept a per-call `settings:` argument, but a pool's `Pool.new(settings: ...)` defaults *are* carried into inserts (they're applied to the generated INSERT query), so insert-time tuning like `insert_quorum` or `max_insert_threads` belongs there. For a one-off override, use `#execute` to run an explicit `INSERT ... SETTINGS k=v VALUES ...` statement.
 
 ### `#insert(table, rows, columns: nil, db_name: nil, types: nil)`
 

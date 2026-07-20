@@ -1004,6 +1004,7 @@ struct InsertNoGVL {
     Client* client;
     const std::string* table;
     const Block* block;
+    const std::vector<std::pair<std::string, std::string>>* settings;
     std::exception_ptr err;
 };
 }  // namespace
@@ -1011,7 +1012,7 @@ struct InsertNoGVL {
 static void* insert_no_gvl(void* data) {
     auto* a = static_cast<InsertNoGVL*>(data);
     try {
-        a->client->Insert(*a->table, *a->block);
+        a->client->Insert(*a->table, *a->block, *a->settings);
     } catch (...) {
         a->err = std::current_exception();
     }
@@ -1077,7 +1078,7 @@ static VALUE ch_client_insert_block(VALUE self, VALUE rb_table, VALUE rb_columns
             block.AppendColumn(names[i], cols[i]);
         }
 
-        InsertNoGVL args{c->client.get(), &table, &block, nullptr};
+        InsertNoGVL args{c->client.get(), &table, &block, &c->default_settings, nullptr};
         rb_thread_call_without_gvl(insert_no_gvl, &args, insert_unblock, &args);
         if (args.err) {
             try { c->client->ResetConnection(); } catch (...) {}
