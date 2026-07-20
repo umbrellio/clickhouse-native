@@ -101,6 +101,9 @@ client.close
 | `password:`   | `""`          |                                                     |
 | `compression:`| `:none`       | `:none`, `:lz4`, or `:zstd`                         |
 | `logger:`     | `nil`         | any `Logger`-compatible object (see [Logging](#logging)) |
+| `ping_before_query:` | `true` | ping and transparently reconnect a dead socket before each query (see [Connection resilience](#connection-resilience)) |
+| `tcp_keepalive:` | `true`     | enable OS-level TCP keepalive on the socket          |
+| `retry_timeout:` | `1`        | seconds to back off before each reconnect attempt    |
 
 `Pool.new` additionally accepts:
 
@@ -109,6 +112,20 @@ client.close
 | `pool_size:`    | `5`     |                                                          |
 | `pool_timeout:` | `5`     | seconds                                                  |
 | `settings:`     | `{}`    | session settings applied to every client in the pool (see [Session settings](#session-settings)) |
+
+## Connection resilience
+
+Long-lived pooled connections get closed out from under you — ClickHouse's `idle_connection_timeout`, a load balancer recycling idle sockets, or a server restart. The next use of such a socket would otherwise fail with `ConnectionError: closed: ...` (the errno in the message is whatever stale value was left in the thread — `Success`, `Operation now in progress`, etc. — and is not meaningful).
+
+By default the driver defends against this:
+
+- **`ping_before_query`** sends a lightweight ping before each query. If the socket is dead, the driver reconnects (re-running the handshake) and retries the ping before the real query runs, so a stale connection is repaired transparently instead of surfacing an error.
+- **`tcp_keepalive`** enables OS-level TCP keepalive so idle sockets are kept warm and dead peers are detected sooner.
+- **`retry_timeout`** bounds the back-off (in seconds) before each reconnect attempt.
+
+`Pool#with` additionally retries once on `ConnectionError` as a backstop for the residual race where a socket dies between the ping and the query.
+
+The per-query ping adds one round-trip per query. Set `ping_before_query: false` to opt out and manage staleness yourself (e.g. via `#reset_connection`).
 
 ## API
 

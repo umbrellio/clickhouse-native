@@ -2,6 +2,7 @@
 
 require "bigdecimal"
 require "logger"
+require "socket"
 require "stringio"
 require "clickhouse_native"
 
@@ -13,6 +14,90 @@ CH_KWARGS = { host: CH_HOST, port: CH_PORT }.freeze
 # versions (allow_experimental_json_type on 24.x, enable_json_type on 25.x);
 # both are sent and the server silently ignores whichever it doesn't know.
 CH_JSON_ENABLE = { allow_experimental_json_type: 1, enable_json_type: 1 }.freeze
+
+# Minimal TCP pass-through proxy used to simulate a server / load balancer
+# dropping an established connection (idle_connection_timeout, LB recycle).
+# A client points at #port; #sever_all tears down every live tunnel so the
+# client's next use of that socket hits recv()==0, exactly like production.
+# The accept loop keeps running, so reconnects succeed against a fresh tunnel.
+#
+# The accept/tunnel loop runs in a CHILD PROCESS: Client#initialize does its
+# connect+handshake without releasing the GVL, so an in-process accept thread
+# could never run and the very first connect would deadlock. A separate process
+# has its own GVL. #sever_all signals the child (SIGUSR1) to drop live tunnels.
+class TcpProxy
+  attr_reader :port
+
+  def initialize(upstream_host:, upstream_port:)
+    @upstream_host = upstream_host
+    @upstream_port = upstream_port
+    @server = TCPServer.new("127.0.0.1", 0)
+    @port = @server.addr[1]
+  end
+
+  def start
+    @pid = fork do
+      run_child
+    rescue Exception # rubocop:disable Lint/RescueException
+      nil
+    ensure
+      exit!(0) # never fall back into the RSpec process
+    end
+    @server.close
+    self
+  end
+
+  def sever_all
+    Process.kill("USR1", @pid)
+  end
+
+  def stop
+    Process.kill("KILL", @pid)
+    Process.wait(@pid)
+  rescue Errno::ESRCH, Errno::ECHILD
+    nil
+  end
+
+  private
+
+  def run_child
+    conns = []
+    # The trap fires on this same (accept-loop) thread, so no lock is needed —
+    # and Mutex/Thread ops are illegal in a trap context anyway.
+    trap("USR1") do
+      live = conns
+      conns = []
+      live.each do |a, b|
+        close(a)
+        close(b)
+      end
+    end
+    loop do
+      downstream = @server.accept
+      upstream = TCPSocket.new(@upstream_host, @upstream_port)
+      conns << [downstream, upstream]
+      Thread.new { pump(downstream, upstream) }
+      Thread.new { pump(upstream, downstream) }
+    end
+  rescue IOError, Errno::EBADF
+    nil
+  end
+
+  def pump(src, dst)
+    IO.copy_stream(src, dst)
+  rescue IOError, Errno::EBADF, Errno::ECONNRESET, Errno::EPIPE
+    nil
+  ensure
+    close(src)
+    close(dst)
+  end
+
+  def close(io)
+    io&.close
+  rescue IOError
+    nil
+  end
+end
 
 RSpec.configure do |config|
   config.expect_with :rspec do |c|

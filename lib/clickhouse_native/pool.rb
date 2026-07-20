@@ -8,11 +8,15 @@ module ClickhouseNative
 
     def initialize(host:, port:, database: "default", user: "default", password: "",
                    compression: :none, logger: nil, settings: {},
-                   pool_size: 5, pool_timeout: 5)
+                   pool_size: 5, pool_timeout: 5,
+                   ping_before_query: true, tcp_keepalive: true, retry_timeout: 1)
       @host = host
       @port = port
       @database = database
-      client_kwargs = { host:, port:, database:, user:, password:, compression:, logger: }
+      client_kwargs = {
+        host:, port:, database:, user:, password:, compression:, logger:,
+        ping_before_query:, tcp_keepalive:, retry_timeout:
+      }
       @set_sql = settings_sql(settings)
       @pool = ConnectionPool.new(size: pool_size, timeout: pool_timeout) do
         client = Client.new(**client_kwargs)
@@ -32,11 +36,18 @@ module ClickhouseNative
     #
     # ConnectionError gets one automatic retry: pooled connections that
     # have been idle long enough for the server / an LB to FIN them
-    # surface as "closed" on the very next recv (errno 0, message
-    # "closed: Success"). Discarding and re-checking out lands a fresh
-    # socket and the operation succeeds. The retry only triggers when
-    # the dead-connection error fired before any data was sent, so
-    # write operations don't risk double-execution from this path.
+    # surface as "closed" on the very next recv (errno is whatever stale
+    # value was left in the thread — "closed: Success", "closed: Operation
+    # now in progress", etc. all mean the same recv()==0). Discarding and
+    # re-checking out lands a fresh socket and the operation succeeds. The
+    # retry only triggers when the dead-connection error fired before any
+    # data was sent, so write operations don't risk double-execution.
+    #
+    # This is the backstop: with ping_before_query on (the default) the
+    # driver already pings and transparently reconnects a dead socket
+    # before running the query, so most stale connections never surface as
+    # a ConnectionError here at all. This retry still covers the residual
+    # race (socket dies between the ping and the query).
     def with
       attempts = 0
       begin

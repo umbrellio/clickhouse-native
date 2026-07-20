@@ -17,6 +17,7 @@
 #include <clickhouse/exceptions.h>
 #include <clickhouse/types/types.h>
 
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -707,6 +708,18 @@ static uint16_t kwarg_uint16(VALUE kwargs, const char* key, uint16_t fallback) {
     return static_cast<uint16_t>(NUM2UINT(v));
 }
 
+static bool kwarg_bool(VALUE kwargs, const char* key, bool fallback) {
+    VALUE v = rb_hash_lookup2(kwargs, ID2SYM(rb_intern(key)), Qundef);
+    if (v == Qundef) return fallback;
+    return RTEST(v);
+}
+
+static unsigned int kwarg_uint(VALUE kwargs, const char* key, unsigned int fallback) {
+    VALUE v = rb_hash_lookup2(kwargs, ID2SYM(rb_intern(key)), Qundef);
+    if (v == Qundef || NIL_P(v)) return fallback;
+    return NUM2UINT(v);
+}
+
 static CompressionMethod kwarg_compression(VALUE kwargs) {
     VALUE v = rb_hash_lookup2(kwargs, ID2SYM(rb_intern("compression")), Qundef);
     if (v == Qundef || NIL_P(v)) return CompressionMethod::None;
@@ -778,12 +791,27 @@ static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
     std::string password = kwarg_str(kwargs, "password", "");
     CompressionMethod compression = kwarg_compression(kwargs);
 
+    // Connection-resilience defaults. Long-lived pooled connections get
+    // silently closed by the server (idle_connection_timeout) or an LB, so
+    // the next use of a checked-out client would otherwise hit recv()==0 and
+    // raise ConnectionError("closed: ..."). ping_before_query makes the driver
+    // ping first and transparently reconnect on a dead socket; tcp_keepalive
+    // keeps idle sockets healthy at the OS level. retry_timeout is the backoff
+    // before each reconnect attempt — kept low (1s) since a pooled reconnect
+    // to a live server should be quick and we don't want to stall queries.
+    bool ping_before_query = kwarg_bool(kwargs, "ping_before_query", true);
+    bool tcp_keepalive = kwarg_bool(kwargs, "tcp_keepalive", true);
+    unsigned int retry_timeout = kwarg_uint(kwargs, "retry_timeout", 1);
+
     CHClient* c = as_client(self);
     try {
         ClientOptions opts;
         opts.SetHost(host).SetPort(port)
             .SetDefaultDatabase(database).SetUser(user).SetPassword(password)
-            .SetCompressionMethod(compression);
+            .SetCompressionMethod(compression)
+            .SetPingBeforeQuery(ping_before_query)
+            .TcpKeepAlive(tcp_keepalive)
+            .SetRetryTimeout(std::chrono::seconds(retry_timeout));
         c->client = std::make_unique<Client>(opts);
     } catch (const std::exception& e) {
         raise_mapped_ex(e);
@@ -792,6 +820,9 @@ static VALUE ch_client_initialize(int argc, VALUE* argv, VALUE self) {
     rb_ivar_set(self, rb_intern("@host"), rb_utf8_str_new(host.data(), host.size()));
     rb_ivar_set(self, rb_intern("@port"), UINT2NUM(port));
     rb_ivar_set(self, rb_intern("@database"), rb_utf8_str_new(database.data(), database.size()));
+    rb_ivar_set(self, rb_intern("@ping_before_query"), ping_before_query ? Qtrue : Qfalse);
+    rb_ivar_set(self, rb_intern("@tcp_keepalive"), tcp_keepalive ? Qtrue : Qfalse);
+    rb_ivar_set(self, rb_intern("@retry_timeout"), UINT2NUM(retry_timeout));
 
     VALUE logger = rb_hash_lookup2(kwargs, ID2SYM(rb_intern("logger")), Qnil);
     rb_ivar_set(self, rb_intern("@logger"), logger);

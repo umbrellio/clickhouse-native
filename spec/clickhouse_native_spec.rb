@@ -684,3 +684,75 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
     end
   end
 end
+
+RSpec.describe "connection resilience", :clickhouse do
+  describe "options on Client" do
+    it "defaults ping_before_query and tcp_keepalive on, retry_timeout to 1s" do
+      client = ClickhouseNative::Client.new(**CH_KWARGS)
+      expect(client.ping_before_query).to be(true)
+      expect(client.tcp_keepalive).to be(true)
+      expect(client.retry_timeout).to eq(1)
+      client.close
+    end
+
+    it "honors explicit overrides" do
+      client = ClickhouseNative::Client.new(
+        **CH_KWARGS, ping_before_query: false, tcp_keepalive: false, retry_timeout: 4,
+      )
+      expect(client.ping_before_query).to be(false)
+      expect(client.tcp_keepalive).to be(false)
+      expect(client.retry_timeout).to eq(4)
+      client.close
+    end
+  end
+
+  describe "options on Pool" do
+    it "forwards them to checked-out clients" do
+      pool = ClickhouseNative::Pool.new(
+        **CH_KWARGS, pool_size: 1, ping_before_query: false, retry_timeout: 2,
+      )
+      pool.with do |client|
+        expect(client.ping_before_query).to be(false)
+        expect(client.retry_timeout).to eq(2)
+      end
+    end
+
+    it "defaults its clients to ping_before_query on" do
+      pool = ClickhouseNative::Pool.new(**CH_KWARGS, pool_size: 1)
+      pool.with { |client| expect(client.ping_before_query).to be(true) }
+    end
+  end
+
+  # A server / LB silently closing an idle pooled connection is the root cause
+  # of the "closed: ..." ConnectionError this option set defends against.
+  describe "stale-connection recovery" do
+    let(:proxy) { TcpProxy.new(upstream_host: CH_HOST, upstream_port: CH_PORT).start }
+
+    after { proxy.stop }
+
+    it "transparently reconnects when the server dropped the connection" do
+      client = ClickhouseNative::Client.new(
+        host: "127.0.0.1", port: proxy.port, ping_before_query: true, retry_timeout: 0,
+      )
+      expect(client.query_value("SELECT 1")).to eq(1)
+
+      proxy.sever_all
+
+      expect(client.query_value("SELECT 2")).to eq(2)
+      client.close
+    end
+
+    it "raises ConnectionError on a dropped connection with ping_before_query off" do
+      client = ClickhouseNative::Client.new(
+        host: "127.0.0.1", port: proxy.port, ping_before_query: false,
+      )
+      expect(client.query_value("SELECT 1")).to eq(1)
+
+      proxy.sever_all
+
+      expect { client.query_value("SELECT 2") }
+        .to raise_error(ClickhouseNative::ConnectionError)
+      client.close
+    end
+  end
+end
