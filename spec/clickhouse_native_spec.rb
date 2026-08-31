@@ -712,21 +712,28 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       "SELECT sum(sleepEachRow(0.01)) FROM numbers(600) SETTINGS max_block_size = 10"
     end
 
+    # A query that streams its rows back, rather than withholding them until an
+    # aggregate finishes — so a kill can land while the row block is running.
+    let(:streaming_query) { "SELECT number FROM numbers(200000)" }
+
     # Returns the client the thread checked out, plus the thread itself. The
     # queue makes the checkout a happens-before rather than something a sleep
     # races: a loaded runner can otherwise take the kill before the thread has
-    # reached the pool at all, and the example fails for the wrong reason. The
-    # remaining beat only lets the query get out to the server.
-    def start_query(pool, query)
+    # reached the pool at all, and the example fails for the wrong reason.
+    #
+    # `ready` is for the cases where the state under test is not just "the
+    # query is out" — pass a queue the block pushes to once it is there, and
+    # the kill waits for that instead of guessing with a sleep.
+    def start_query(pool, ready: nil)
       checked_out = Queue.new
       thread = Thread.new do
         pool.with do |client|
           checked_out << client
-          client.execute(query)
+          yield client
         end
       end
       client = checked_out.pop
-      sleep 0.2
+      ready ? ready.pop : sleep(0.2)
       [client, thread]
     end
 
@@ -747,7 +754,7 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
     # streaming a reply at it.
     it "discards the client when its thread is killed mid-query" do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
-      client, thread = start_query(p, slow_query)
+      client, thread = start_query(p) { |c| c.execute(slow_query) }
 
       thread.kill
       thread.join
@@ -764,7 +771,7 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
 
       3.times do |i|
-        _client, thread = start_query(p, slow_query)
+        _client, thread = start_query(p) { |c| c.execute(slow_query) }
         thread.kill
         thread.join
 
@@ -780,30 +787,39 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       captured = nil
       p.with { |c| captured = c }
 
-      p.query_each("SELECT number FROM numbers(200000)") { |_r| break }
+      p.query_each(streaming_query) { |_r| break }
 
       p.with { |c| expect(c).to be(captured) }
       expect(p.query_value("SELECT 1")).to eq(1)
     end
 
-    # query_each takes a different route from execute: its row callback re-enters
-    # Ruby through rb_thread_call_with_gvl, which unregisters the unblock
-    # function on the way in, so a kill lands on one of two paths depending on
-    # where it catches the thread. query_each_unblock also writes state->aborted
-    # from the interrupting thread.
-    it "discards the client when a streaming read is killed mid-stream" do
+    # query_each_unblock, reached the same way execute's is: the thread is parked
+    # in recv() waiting for the aggregate, so the unblock function fires.
+    it "discards the client when a streaming read is killed awaiting rows" do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
-      checked_out = Queue.new
-      thread = Thread.new do
-        p.with do |client|
-          checked_out << client
-          rows = 0
-          client.query_each("SELECT sum(sleepEachRow(0.01)) FROM numbers(600) " \
-                            "SETTINGS max_block_size = 10") { |_r| rows += 1 }
+      client, thread = start_query(p) { |c| c.query_each(slow_query) { |_r| nil } }
+
+      thread.kill
+      thread.join
+
+      p.with { |c| expect(c).not_to be(client) }
+      expect(p.query_value("SELECT 1")).to eq(1)
+    end
+
+    # The other half of query_each, which the example above cannot reach. Its row
+    # block re-enters Ruby through rb_thread_call_with_gvl, which unregisters the
+    # unblock function, so a kill landing here unwinds through the rb_protect
+    # around the row block rather than through query_each_unblock. Parking inside
+    # the block is what puts the kill there every run rather than by luck.
+    it "discards the client when a killed streaming read is inside its row block" do
+      p = described_class.new(**CH_KWARGS, pool_size: 1)
+      in_row_block = Queue.new
+      client, thread = start_query(p, ready: in_row_block) do |c|
+        c.query_each(streaming_query) do |_r|
+          in_row_block << true
+          sleep 5
         end
       end
-      client = checked_out.pop
-      sleep 0.2
 
       thread.kill
       thread.join
@@ -816,7 +832,7 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
     # kill would quietly wait out the whole query instead of cutting it short.
     it "unblocks a killed query instead of waiting it out" do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
-      _client, thread = start_query(p, slow_query)
+      _client, thread = start_query(p) { |c| c.execute(slow_query) }
 
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       thread.kill

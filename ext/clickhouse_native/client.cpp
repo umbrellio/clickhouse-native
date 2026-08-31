@@ -915,9 +915,13 @@ static VALUE ch_client_execute(int argc, VALUE* argv, VALUE self) {
         // clickhouse-cpp may leave the read stream partially consumed when the
         // server exception or an unsupported-type error is thrown mid-block.
         // Reset so the next call on this Client starts from a clean protocol.
-        // Not after a cancel, though: that socket is already shut down and the
-        // pool discards the client, so the connect+handshake is pure cost — and
-        // it runs with the GVL held, serialising every killed sibling behind it.
+        // Not after a cancel: that socket is already shut down and the caller
+        // discards the client, so the connect+handshake buys nothing. A
+        // Thread#kill or Timeout never gets here at all — step 5 of
+        // rb_thread_call_without_gvl delivers the interrupt before it returns —
+        // so this covers what is left: an unblock function that fires without a
+        // longjmp behind it, from a trap handler that does not raise or an
+        // interrupt Thread.handle_interrupt has deferred.
         if (!args.cancelled) { try { c->client->ResetConnection(); } catch (...) {} }
         try { std::rethrow_exception(args.err); }
         catch (const std::exception& e) { raise_mapped_ex(e); }
