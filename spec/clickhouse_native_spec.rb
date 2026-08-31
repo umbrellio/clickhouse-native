@@ -706,10 +706,28 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
   end
 
   describe "discard-on-error" do
-    # Long enough that the killing thread lands while the client is parked in
+    # Long enough that the kill lands while the client is still parked in
     # recv(), which is the state the crash needed.
     let(:slow_query) do
       "SELECT sum(sleepEachRow(0.01)) FROM numbers(600) SETTINGS max_block_size = 10"
+    end
+
+    # Returns the client the thread checked out, plus the thread itself. The
+    # queue makes the checkout a happens-before rather than something a sleep
+    # races: a loaded runner can otherwise take the kill before the thread has
+    # reached the pool at all, and the example fails for the wrong reason. The
+    # remaining beat only lets the query get out to the server.
+    def start_query(pool, query)
+      checked_out = Queue.new
+      thread = Thread.new do
+        pool.with do |client|
+          checked_out << client
+          client.execute(query)
+        end
+      end
+      client = checked_out.pop
+      sleep 0.2
+      [client, thread]
     end
 
     it "closes the client when its block raises" do
@@ -729,17 +747,14 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
     # streaming a reply at it.
     it "discards the client when its thread is killed mid-query" do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
-      captured = nil
-      p.with { |c| captured = c }
+      client, thread = start_query(p, slow_query)
 
-      t = Thread.new { p.execute(slow_query) }
-      sleep 0.3
-      t.kill
-      t.join
+      thread.kill
+      thread.join
 
       # pool_size is 1, so a client that was not discarded comes straight back.
-      p.with { |c| expect(c).not_to be(captured) }
-      expect { captured.ping }.to raise_error(ClickhouseNative::ConnectionError)
+      p.with { |c| expect(c).not_to be(client) }
+      expect { client.ping }.to raise_error(ClickhouseNative::ConnectionError)
     end
 
     # The reply the killed query abandoned must not become the next
@@ -749,10 +764,9 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
 
       3.times do |i|
-        t = Thread.new { p.execute(slow_query) }
-        sleep 0.3
-        t.kill
-        t.join
+        _client, thread = start_query(p, slow_query)
+        thread.kill
+        thread.join
 
         expect(p.query_value("SELECT #{i}")).to eq(i)
       end
@@ -762,12 +776,11 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
     # kill would quietly wait out the whole query instead of cutting it short.
     it "unblocks a killed query instead of waiting it out" do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
-      t = Thread.new { p.execute(slow_query) }
-      sleep 0.3
+      _client, thread = start_query(p, slow_query)
 
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      t.kill
-      t.join
+      thread.kill
+      thread.join
 
       expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 2
     end
