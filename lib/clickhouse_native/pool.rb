@@ -45,27 +45,17 @@ module ClickhouseNative
     # a ConnectionError here at all. This retry still covers the residual
     # race (socket dies between the ping and the query).
     #
-    # The discard hangs off `ensure`, not `rescue`, because the ways a
-    # query gets abandoned mid-flight mostly are not StandardError.
-    # Thread#kill raises nothing at all (Parallel.in_threads kills every
-    # sibling worker when one of them fails), and Timeout / Sidekiq
-    # shutdown raise off Exception. A `rescue` misses all of those and
-    # checks a connection back in with the server still streaming a
-    # response at it — the next checkout then reads that leftover as its
-    # own, which surfaces as a bogus packet type far from here.
+    # A bare `rescue` is not enough to spot an abandoned query. Timeout and
+    # Sidekiq shutdown raise off Exception rather than StandardError, and
+    # Thread#kill raises nothing at all — Parallel.in_threads kills every
+    # sibling worker the moment one of them fails. Miss those and the
+    # connection goes back in with the server still streaming a response at
+    # it; the next checkout reads that leftover as its own, which surfaces
+    # as a bogus packet type far from here.
     def with
       attempts = 0
       begin
-        @pool.with do |client|
-          finished = false
-          begin
-            result = yield client
-            finished = true
-            result
-          ensure
-            @pool.discard_current_connection(&:close) unless finished
-          end
-        end
+        @pool.with { |client| discard_unless_clean { yield client } }
       rescue ConnectionError
         attempts += 1
         retry if attempts == 1
@@ -103,6 +93,31 @@ module ClickhouseNative
 
     def describe_table(table, db_name: nil)
       with { |c| c.describe_table(table, db_name:) }
+    end
+
+    private
+
+    # Keep the client only when the block either finished or left of its own
+    # accord. A plain `break` out of a streaming read is deliberate and the
+    # driver has already drained the query, so that connection is still good
+    # and discarding it would just churn the pool. An exception is an abort,
+    # and so is Thread#kill — which raises nothing, so no rescue ever sees
+    # it, and the only trace it leaves is an "aborting" thread while ensure
+    # runs.
+    def discard_unless_clean
+      finished = false
+      begin
+        result = yield
+        finished = true
+        result
+      rescue Exception # rubocop:disable Lint/RescueException
+        @pool.discard_current_connection(&:close)
+        raise
+      ensure
+        if !finished && Thread.current.status == "aborting"
+          @pool.discard_current_connection(&:close)
+        end
+      end
     end
   end
 end

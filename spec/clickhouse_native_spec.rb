@@ -772,6 +772,20 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       end
     end
 
+    # A deliberate `break` out of a streaming read is not an abort: the driver
+    # has already drained the query, so the connection is still good and
+    # discarding it would cost a reconnect on a hot path.
+    it "keeps the client when the caller breaks out of a streaming read" do
+      p = described_class.new(**CH_KWARGS, pool_size: 1)
+      captured = nil
+      p.with { |c| captured = c }
+
+      p.query_each("SELECT number FROM numbers(200000)") { |_r| break }
+
+      p.with { |c| expect(c).to be(captured) }
+      expect(p.query_value("SELECT 1")).to eq(1)
+    end
+
     # The unblock function still has to wake the blocked recv(). If it stopped,
     # kill would quietly wait out the whole query instead of cutting it short.
     it "unblocks a killed query instead of waiting it out" do
