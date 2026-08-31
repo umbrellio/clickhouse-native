@@ -22,9 +22,9 @@ module ClickhouseNative
       end
     end
 
-    # On exception, discard the client rather than reuse it: an error
-    # path leaves the socket in an unknown state. The C++ binding issues
-    # ResetConnection, but a subsequent send can still surface buffered
+    # On any non-local exit, discard the client rather than reuse it: an
+    # aborted operation leaves the socket in an unknown state. The C++
+    # binding issues ResetConnection, but a subsequent send can still surface buffered
     # protocol errors from the prior aborted operation — those get
     # attributed to whatever SQL we tried next, producing misleading log
     # lines and re-raises in unrelated code. A fresh socket + handshake is
@@ -44,14 +44,27 @@ module ClickhouseNative
     # before running the query, so most stale connections never surface as
     # a ConnectionError here at all. This retry still covers the residual
     # race (socket dies between the ping and the query).
+    #
+    # The discard hangs off `ensure`, not `rescue`, because the ways a
+    # query gets abandoned mid-flight mostly are not StandardError.
+    # Thread#kill raises nothing at all (Parallel.in_threads kills every
+    # sibling worker when one of them fails), and Timeout / Sidekiq
+    # shutdown raise off Exception. A `rescue` misses all of those and
+    # checks a connection back in with the server still streaming a
+    # response at it — the next checkout then reads that leftover as its
+    # own, which surfaces as a bogus packet type far from here.
     def with
       attempts = 0
       begin
         @pool.with do |client|
-          yield client
-        rescue
-          @pool.discard_current_connection(&:close)
-          raise
+          finished = false
+          begin
+            result = yield client
+            finished = true
+            result
+          ensure
+            @pool.discard_current_connection(&:close) unless finished
+          end
         end
       rescue ConnectionError
         attempts += 1

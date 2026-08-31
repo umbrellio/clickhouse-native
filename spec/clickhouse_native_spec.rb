@@ -706,6 +706,12 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
   end
 
   describe "discard-on-error" do
+    # Long enough that the killing thread lands while the client is parked in
+    # recv(), which is the state the crash needed.
+    let(:slow_query) do
+      "SELECT sum(sleepEachRow(0.01)) FROM numbers(600) SETTINGS max_block_size = 10"
+    end
+
     it "closes the client when its block raises" do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
       captured = nil
@@ -715,6 +721,55 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
 
       expect { captured.ping }.to raise_error(ClickhouseNative::ConnectionError, /closed/)
       expect(p.ping).to be(true)
+    end
+
+    # Thread#kill raises nothing, so a `rescue` never sees it — and
+    # Parallel.in_threads kills every sibling worker as soon as one fails.
+    # The connection used to go back to the pool with the server still
+    # streaming a reply at it.
+    it "discards the client when its thread is killed mid-query" do
+      p = described_class.new(**CH_KWARGS, pool_size: 1)
+      captured = nil
+      p.with { |c| captured = c }
+
+      t = Thread.new { p.execute(slow_query) }
+      sleep 0.3
+      t.kill
+      t.join
+
+      # pool_size is 1, so a client that was not discarded comes straight back.
+      p.with { |c| expect(c).not_to be(captured) }
+      expect { captured.ping }.to raise_error(ClickhouseNative::ConnectionError)
+    end
+
+    # The reply the killed query abandoned must not become the next
+    # checkout's, which surfaced as "unimplemented <n>" from a packet type
+    # read out of the previous response.
+    it "hands out an undesynced connection after a killed query" do
+      p = described_class.new(**CH_KWARGS, pool_size: 1)
+
+      3.times do |i|
+        t = Thread.new { p.execute(slow_query) }
+        sleep 0.3
+        t.kill
+        t.join
+
+        expect(p.query_value("SELECT #{i}")).to eq(i)
+      end
+    end
+
+    # The unblock function still has to wake the blocked recv(). If it stopped,
+    # kill would quietly wait out the whole query instead of cutting it short.
+    it "unblocks a killed query instead of waiting it out" do
+      p = described_class.new(**CH_KWARGS, pool_size: 1)
+      t = Thread.new { p.execute(slow_query) }
+      sleep 0.3
+
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      t.kill
+      t.join
+
+      expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 2
     end
   end
 end

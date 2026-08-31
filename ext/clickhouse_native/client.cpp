@@ -885,11 +885,15 @@ static void* execute_no_gvl(void* data) {
     return nullptr;
 }
 
+// Unblock functions run on the *interrupting* thread while the blocked thread
+// is still inside Client::Execute(). CancelInFlight() only shuts the socket
+// down; ResetConnection() would free the very streams that thread is reading
+// (Thread#kill from Parallel.in_threads, Timeout, Sidekiq shutdown), which
+// reads back as a garbage packet type and then segfaults. The blocked call
+// returns EOF, raises, and the pool discards the client.
 static void execute_unblock(void* data) {
-    // The only safe abort clickhouse-cpp exposes is tearing the connection.
-    // On interrupt we kill the socket; the pool will discard this client.
     auto* a = static_cast<ExecuteNoGVL*>(data);
-    try { a->client->ResetConnection(); } catch (...) {}
+    try { a->client->CancelInFlight(); } catch (...) {}
 }
 
 static VALUE ch_client_execute(int argc, VALUE* argv, VALUE self) {
@@ -1021,7 +1025,7 @@ static void* insert_no_gvl(void* data) {
 
 static void insert_unblock(void* data) {
     auto* a = static_cast<InsertNoGVL*>(data);
-    try { a->client->ResetConnection(); } catch (...) {}
+    try { a->client->CancelInFlight(); } catch (...) {}
 }
 
 static VALUE ch_client_insert_block(VALUE self, VALUE rb_table, VALUE rb_columns, VALUE rb_rows) {
@@ -1166,7 +1170,7 @@ static void* query_each_no_gvl(void* data) {
 static void query_each_unblock(void* data) {
     auto* a = static_cast<QueryEachNoGVL*>(data);
     a->state->aborted = true;
-    try { a->client->ResetConnection(); } catch (...) {}
+    try { a->client->CancelInFlight(); } catch (...) {}
 }
 
 static VALUE ch_client_query_each(int argc, VALUE* argv, VALUE self) {

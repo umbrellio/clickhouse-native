@@ -1,0 +1,103 @@
+diff --git a/clickhouse/base/socket.cpp b/clickhouse/base/socket.cpp
+index 3bb1aa5..f188d3f 100644
+--- a/clickhouse/base/socket.cpp
++++ b/clickhouse/base/socket.cpp
+@@ -345,6 +345,19 @@ Socket::~Socket() {
+     Close();
+ }
+ 
++void Socket::Cancel() {
++    if (handle_ == INVALID_SOCKET) {
++        return;
++    }
++    // shutdown(), not close(): the descriptor stays valid, so a concurrent
++    // reader returns EOF instead of racing a reused fd number.
++#if defined(_win_)
++    shutdown(handle_, SD_BOTH);
++#else
++    ::shutdown(handle_, SHUT_RDWR);
++#endif
++}
++
+ void Socket::Close() {
+     CloseSocket(handle_);
+     handle_ = INVALID_SOCKET;
+diff --git a/clickhouse/base/socket.h b/clickhouse/base/socket.h
+index 9bd9ca3..0234b1e 100644
+--- a/clickhouse/base/socket.h
++++ b/clickhouse/base/socket.h
+@@ -80,6 +80,12 @@ public:
+ 
+     virtual std::unique_ptr<InputStream> makeInputStream() const = 0;
+     virtual std::unique_ptr<OutputStream> makeOutputStream() const = 0;
++
++    /// Unblock a thread parked in recv()/send() on this socket. Unlike
++    /// closing or replacing the socket it destroys nothing, so it is safe
++    /// to call from another thread while the owner is mid-read: the owner
++    /// sees EOF and unwinds through its own frames.
++    virtual void Cancel() {}
+ };
+ 
+ 
+@@ -123,6 +129,8 @@ public:
+     std::unique_ptr<InputStream> makeInputStream() const override;
+     std::unique_ptr<OutputStream> makeOutputStream() const override;
+ 
++    void Cancel() override;
++
+ protected:
+     Socket(const Socket&) = delete;
+     Socket& operator = (const Socket&) = delete;
+diff --git a/clickhouse/client.cpp b/clickhouse/client.cpp
+index c9732f4..3ba655d 100644
+--- a/clickhouse/client.cpp
++++ b/clickhouse/client.cpp
+@@ -226,6 +226,8 @@ public:
+ 
+     void ResetConnection();
+ 
++    void CancelInFlight();
++
+     void ResetConnectionEndpoint();
+ 
+     const ServerInfo& GetServerInfo() const;
+@@ -610,6 +612,12 @@ void Client::Impl::Ping() {
+     }
+ }
+ 
++void Client::Impl::CancelInFlight() {
++    if (socket_) {
++        socket_->Cancel();
++    }
++}
++
+ void Client::Impl::ResetConnection() {
+     InitializeStreams(socket_factory_->connect(options_, current_endpoint_.value()));
+     state_ = State::Idle;
+@@ -1408,6 +1416,10 @@ void Client::ResetConnection() {
+     impl_->ResetConnection();
+ }
+ 
++void Client::CancelInFlight() {
++    impl_->CancelInFlight();
++}
++
+ void Client::ResetConnectionEndpoint() {
+     impl_->ResetConnectionEndpoint();
+ }
+diff --git a/clickhouse/client.h b/clickhouse/client.h
+index 6c6ff53..27be58c 100644
+--- a/clickhouse/client.h
++++ b/clickhouse/client.h
+@@ -326,6 +326,11 @@ public:
+     /// Reset connection with initial params.
+     void ResetConnection();
+ 
++    /// Unblock a thread parked in an Execute()/Insert() socket read.
++    /// Destroys nothing, so unlike ResetConnection() it is safe to call
++    /// from another thread while a query is still in flight.
++    void CancelInFlight();
++
+     const ServerInfo& GetServerInfo() const;
+ 
+     /// Get current connected endpoint.
