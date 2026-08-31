@@ -22,9 +22,9 @@ module ClickhouseNative
       end
     end
 
-    # On any non-local exit, discard the client rather than reuse it: an
-    # aborted operation leaves the socket in an unknown state. The C++
-    # binding issues ResetConnection, but a subsequent send can still surface buffered
+    # On an aborted operation, discard the client rather than reuse it: the
+    # socket is left in an unknown state. The C++ binding issues
+    # ResetConnection, but a subsequent send can still surface buffered
     # protocol errors from the prior aborted operation — those get
     # attributed to whatever SQL we tried next, producing misleading log
     # lines and re-raises in unrelated code. A fresh socket + handshake is
@@ -98,12 +98,12 @@ module ClickhouseNative
     private
 
     # Keep the client only when the block either finished or left of its own
-    # accord. A plain `break` out of a streaming read is deliberate and the
-    # driver has already drained the query, so that connection is still good
-    # and discarding it would just churn the pool. An exception is an abort,
-    # and so is Thread#kill — which raises nothing, so no rescue ever sees
-    # it, and the only trace it leaves is an "aborting" thread while ensure
-    # runs.
+    # accord. A `break` out of a streaming read is deliberate, and the binding
+    # has already reconnected the client on its way out (query_each resets the
+    # connection before rb_jump_tag), so it is good to reuse — discarding would
+    # buy a second connect on top of the one already paid. An exception is an
+    # abort, and so is Thread#kill: it raises nothing, so no rescue ever sees
+    # it, and its only trace is an "aborting" thread while ensure runs.
     def discard_unless_clean
       finished = false
       begin

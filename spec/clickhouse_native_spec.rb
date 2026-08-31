@@ -772,9 +772,9 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       end
     end
 
-    # A deliberate `break` out of a streaming read is not an abort: the driver
-    # has already drained the query, so the connection is still good and
-    # discarding it would cost a reconnect on a hot path.
+    # A deliberate `break` out of a streaming read is not an abort: query_each
+    # already reset the connection on its way out, so discarding here would buy
+    # a second connect on top of the one just paid for.
     it "keeps the client when the caller breaks out of a streaming read" do
       p = described_class.new(**CH_KWARGS, pool_size: 1)
       captured = nil
@@ -783,6 +783,32 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       p.query_each("SELECT number FROM numbers(200000)") { |_r| break }
 
       p.with { |c| expect(c).to be(captured) }
+      expect(p.query_value("SELECT 1")).to eq(1)
+    end
+
+    # query_each takes a different route from execute: its row callback re-enters
+    # Ruby through rb_thread_call_with_gvl, which unregisters the unblock
+    # function on the way in, so a kill lands on one of two paths depending on
+    # where it catches the thread. query_each_unblock also writes state->aborted
+    # from the interrupting thread.
+    it "discards the client when a streaming read is killed mid-stream" do
+      p = described_class.new(**CH_KWARGS, pool_size: 1)
+      checked_out = Queue.new
+      thread = Thread.new do
+        p.with do |client|
+          checked_out << client
+          rows = 0
+          client.query_each("SELECT sum(sleepEachRow(0.01)) FROM numbers(600) " \
+                            "SETTINGS max_block_size = 10") { |_r| rows += 1 }
+        end
+      end
+      client = checked_out.pop
+      sleep 0.2
+
+      thread.kill
+      thread.join
+
+      p.with { |c| expect(c).not_to be(client) }
       expect(p.query_value("SELECT 1")).to eq(1)
     end
 

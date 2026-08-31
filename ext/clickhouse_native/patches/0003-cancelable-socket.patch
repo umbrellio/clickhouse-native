@@ -49,10 +49,18 @@ index 9bd9ca3..0234b1e 100644
      Socket(const Socket&) = delete;
      Socket& operator = (const Socket&) = delete;
 diff --git a/clickhouse/client.cpp b/clickhouse/client.cpp
-index c9732f4..3ba655d 100644
+index c9732f4..88c9b84 100644
 --- a/clickhouse/client.cpp
 +++ b/clickhouse/client.cpp
-@@ -226,6 +226,8 @@ public:
+@@ -9,6 +9,7 @@
+ #include "columns/factory.h"
+ 
+ #include <cassert>
++#include <mutex>
+ #include <optional>
+ #include <sstream>
+ #include <system_error>
+@@ -226,6 +227,8 @@ public:
  
      void ResetConnection();
  
@@ -61,20 +69,45 @@ index c9732f4..3ba655d 100644
      void ResetConnectionEndpoint();
  
      const ServerInfo& GetServerInfo() const;
-@@ -610,6 +612,12 @@ void Client::Impl::Ping() {
+@@ -313,6 +316,11 @@ private:
+ 
+     std::unique_ptr<SocketFactory> socket_factory_;
+ 
++    /// Guards socket_ against CancelInFlight() on another thread. Covers the
++    /// swap in ResetConnection() and the displaced socket's destructor, so a
++    /// canceller can never shutdown() an fd that is closing or already reissued.
++    std::mutex socket_mutex_;
++
+     std::unique_ptr<InputStream> input_;
+     std::unique_ptr<OutputStream> output_;
+     std::unique_ptr<SocketBase> socket_;
+@@ -610,8 +618,24 @@ void Client::Impl::Ping() {
      }
  }
  
 +void Client::Impl::CancelInFlight() {
++    std::lock_guard<std::mutex> lock(socket_mutex_);
 +    if (socket_) {
 +        socket_->Cancel();
 +    }
 +}
 +
  void Client::Impl::ResetConnection() {
-     InitializeStreams(socket_factory_->connect(options_, current_endpoint_.value()));
+-    InitializeStreams(socket_factory_->connect(options_, current_endpoint_.value()));
++    auto fresh = socket_factory_->connect(options_, current_endpoint_.value());
++    {
++        // InitializeStreams swaps, so `fresh` comes back holding the *old*
++        // socket; reset it here so its destructor runs under the lock too.
++        // Left to itself it would die in this function's full-expression,
++        // outside any lock, which is the window CancelInFlight() must not hit.
++        std::lock_guard<std::mutex> lock(socket_mutex_);
++        InitializeStreams(std::move(fresh));
++        fresh.reset();
++    }
      state_ = State::Idle;
-@@ -1408,6 +1416,10 @@ void Client::ResetConnection() {
+ 
+     if (!Handshake()) {
+@@ -1408,6 +1432,10 @@ void Client::ResetConnection() {
      impl_->ResetConnection();
  }
  

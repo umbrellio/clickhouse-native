@@ -872,6 +872,7 @@ struct ExecuteNoGVL {
     Client* client;
     const Query* query;
     std::exception_ptr err;
+    bool cancelled;
 };
 }  // namespace
 
@@ -893,6 +894,7 @@ static void* execute_no_gvl(void* data) {
 // returns EOF, raises, and the pool discards the client.
 static void execute_unblock(void* data) {
     auto* a = static_cast<ExecuteNoGVL*>(data);
+    a->cancelled = true;
     try { a->client->CancelInFlight(); } catch (...) {}
 }
 
@@ -907,13 +909,16 @@ static VALUE ch_client_execute(int argc, VALUE* argv, VALUE self) {
     apply_default_settings(q, c);
     apply_settings(q, kwargs);
 
-    ExecuteNoGVL args{c->client.get(), &q, nullptr};
+    ExecuteNoGVL args{c->client.get(), &q, nullptr, false};
     rb_thread_call_without_gvl(execute_no_gvl, &args, execute_unblock, &args);
     if (args.err) {
         // clickhouse-cpp may leave the read stream partially consumed when the
         // server exception or an unsupported-type error is thrown mid-block.
         // Reset so the next call on this Client starts from a clean protocol.
-        try { c->client->ResetConnection(); } catch (...) {}
+        // Not after a cancel, though: that socket is already shut down and the
+        // pool discards the client, so the connect+handshake is pure cost — and
+        // it runs with the GVL held, serialising every killed sibling behind it.
+        if (!args.cancelled) { try { c->client->ResetConnection(); } catch (...) {} }
         try { std::rethrow_exception(args.err); }
         catch (const std::exception& e) { raise_mapped_ex(e); }
     }
@@ -1010,6 +1015,7 @@ struct InsertNoGVL {
     const Block* block;
     const std::vector<std::pair<std::string, std::string>>* settings;
     std::exception_ptr err;
+    bool cancelled;
 };
 }  // namespace
 
@@ -1025,6 +1031,7 @@ static void* insert_no_gvl(void* data) {
 
 static void insert_unblock(void* data) {
     auto* a = static_cast<InsertNoGVL*>(data);
+    a->cancelled = true;
     try { a->client->CancelInFlight(); } catch (...) {}
 }
 
@@ -1082,10 +1089,10 @@ static VALUE ch_client_insert_block(VALUE self, VALUE rb_table, VALUE rb_columns
             block.AppendColumn(names[i], cols[i]);
         }
 
-        InsertNoGVL args{c->client.get(), &table, &block, &c->default_settings, nullptr};
+        InsertNoGVL args{c->client.get(), &table, &block, &c->default_settings, nullptr, false};
         rb_thread_call_without_gvl(insert_no_gvl, &args, insert_unblock, &args);
         if (args.err) {
-            try { c->client->ResetConnection(); } catch (...) {}
+            if (!args.cancelled) { try { c->client->ResetConnection(); } catch (...) {} }
             try { std::rethrow_exception(args.err); }
             catch (const std::exception& e) { raise_mapped_ex(e); }
         }
@@ -1118,6 +1125,7 @@ struct QueryEachNoGVL {
     const Query* query;
     QueryEachState* state;
     std::exception_ptr err;
+    bool cancelled;
 };
 }  // namespace
 
@@ -1170,6 +1178,7 @@ static void* query_each_no_gvl(void* data) {
 static void query_each_unblock(void* data) {
     auto* a = static_cast<QueryEachNoGVL*>(data);
     a->state->aborted = true;
+    a->cancelled = true;
     try { a->client->CancelInFlight(); } catch (...) {}
 }
 
@@ -1191,12 +1200,12 @@ static VALUE ch_client_query_each(int argc, VALUE* argv, VALUE self) {
         rb_thread_call_with_gvl(with_gvl_yield, &ya);
         return !state.aborted;
     });
-    QueryEachNoGVL args{c->client.get(), &q, &state, nullptr};
+    QueryEachNoGVL args{c->client.get(), &q, &state, nullptr, false};
 
     rb_thread_call_without_gvl(query_each_no_gvl, &args, query_each_unblock, &args);
 
     if (args.err) {
-        try { c->client->ResetConnection(); } catch (...) {}
+        if (!args.cancelled) { try { c->client->ResetConnection(); } catch (...) {} }
         if (state.exc_tag) rb_jump_tag(state.exc_tag);
         try { std::rethrow_exception(args.err); }
         catch (const std::exception& e) { raise_mapped_ex(e); }
