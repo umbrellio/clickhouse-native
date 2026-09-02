@@ -361,7 +361,9 @@ client.query("SELECT 1")
 
 The extension releases the GVL around every blocking `clickhouse-cpp` call — `execute`, `query`, `query_value`, `query_each`, `insert_block`, `ping`, and the connect in `Client.new` and `#reset_connection` — so a `Pool` of size N genuinely runs N concurrent ClickHouse queries from N Ruby threads, and no single call can stall unrelated threads.
 
-The readers that build Ruby objects (`query`, `query_value`, `query_each`) take the GVL back per result block and drop it again, so a long read stays interruptible: a `Thread#kill` or `Timeout` lands on it rather than waiting for the read to finish, and the connection it was using is discarded rather than reused mid-reply.
+The readers that build Ruby objects take the GVL back for each result block and drop it again, so other threads keep running throughout a long read rather than only between queries — `benchmark/threaded.rb` measures this. `#query_value` is the exception: it stops taking the GVL back once it holds its cell, since there is nothing left to build.
+
+Separately, every blocking call is interruptible. A `Thread#kill` or `Timeout` runs the call's unblock function, which cancels the query in flight, so the kill lands promptly instead of waiting the read out — and the connection it was using is discarded rather than handed back mid-reply. That comes from the unblock function, not from retaking the GVL: `#execute` holds no GVL for its whole round-trip and is interruptible just the same.
 
 `benchmark/threaded.rb` demonstrates this with a `SELECT sleep(0.1)` workload. Example output:
 

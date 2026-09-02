@@ -812,6 +812,7 @@ namespace {
 struct ResetNoGVL {
     Client* client;
     std::exception_ptr err;
+    bool ran;
 };
 
 struct ConnectNoGVL {
@@ -830,6 +831,7 @@ static void* connect_no_gvl(void* data) {
 
 static void* reset_no_gvl(void* data) {
     auto* a = static_cast<ResetNoGVL*>(data);
+    a->ran = true;
     try { a->client->ResetConnection(); } catch (...) { a->err = std::current_exception(); }
     return nullptr;
 }
@@ -844,13 +846,20 @@ static void* reset_no_gvl(void* data) {
 // error, and the ordinary variant checks pending interrupts as it retakes the
 // GVL and can longjmp out. That would jump between an rb_protect tag and the
 // rb_jump_tag meant to re-raise it, or out of the active catch handler in
-// insert_block, and would lose the error the caller came here to report. This
-// stays as inert as the plain call it replaces: failures are swallowed, since
-// the pool discards the client either way.
+// insert_block, and would lose the error the caller came here to report.
+//
+// _gvl2 declines to run `func` at all when an interrupt is already pending,
+// though, so the reset is not guaranteed - and one caller needs it to happen:
+// the `break` out of query_each keeps its client, on the understanding that
+// the reset here left it clean (see Pool#discard_unless_clean). Falling back
+// to the plain call covers that. Holding the GVL for a reconnect is the lesser
+// evil against handing back a connection with a reply still draining into it.
+// Failures stay swallowed either way: the pool discards on every other path.
 static void reset_connection_no_gvl(Client* client) {
     if (!client) return;
-    ResetNoGVL args{client, nullptr};
+    ResetNoGVL args{client, nullptr, false};
     rb_thread_call_without_gvl2(reset_no_gvl, &args, nullptr, nullptr);
+    if (!args.ran) { try { client->ResetConnection(); } catch (...) {} }
 }
 
 // Client.new(host:, port:, database:, user:, password:)
