@@ -215,6 +215,49 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
     end
   end
 
+  # A read that holds the GVL stops every other thread in the process for its
+  # whole duration: timers don't fire, lock heartbeats don't refresh, and a
+  # multi-second query is long enough for a lease to lapse under it. Ruby is
+  # only needed to turn each block into hashes, so the read takes the GVL back
+  # per block instead of holding it throughout (as #query_each already did).
+  describe "GVL release" do
+    let(:slow_query) do
+      "SELECT sum(sleepEachRow(0.01)) FROM numbers(200) SETTINGS max_block_size = 10"
+    end
+
+    # How many times a plain Ruby thread gets to run while the query is in
+    # flight. Pinned near zero when the GVL is held for the whole call.
+    def ticks_during
+      ticks = 0
+      ticker = Thread.new do
+        loop do
+          ticks += 1
+          sleep(0.01)
+        end
+      end
+      sleep(0.1) # let the ticker reach its own schedule first
+      before = ticks
+      yield
+      ticks - before
+    ensure
+      ticker&.kill
+    end
+
+    it "lets other threads run during #query" do
+      client = ClickhouseNative::Client.new(**CH_KWARGS)
+      expect(ticks_during { client.query(slow_query) }).to be > 20
+    ensure
+      client&.close
+    end
+
+    it "lets other threads run during #query_value" do
+      client = ClickhouseNative::Client.new(**CH_KWARGS)
+      expect(ticks_during { client.query_value(slow_query) }).to be > 20
+    ensure
+      client&.close
+    end
+  end
+
   describe "#describe_table" do
     it "returns [{name:, type:, ...}]" do
       cols = client.describe_table("one", db_name: "system")
