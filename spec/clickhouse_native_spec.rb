@@ -256,6 +256,37 @@ RSpec.describe ClickhouseNative::Client, :clickhouse do
     ensure
       client&.close
     end
+
+    # value_at throws for a type it cannot decode, and the readers now call it
+    # from inside rb_protect. Unwinding a C++ exception through that frame skips
+    # its epilogue and takes the interpreter down, so the throw is caught in the
+    # frame it happens in and carried out. UUID reaches value_at's default arm;
+    # Dynamic and Variant, which the type specs use, are rejected earlier by
+    # clickhouse-cpp and never reach it.
+    %i[query query_value].each do |reader|
+      it "raises rather than crashing when #{reader} hits an undecodable type" do
+        client = ClickhouseNative::Client.new(**CH_KWARGS)
+
+        expect { client.public_send(reader, "SELECT generateUUIDv4()") }
+          .to raise_error(ClickhouseNative::UnsupportedTypeError)
+
+        # The interpreter's tag stack has to still be intact afterwards.
+        expect { raise "after" }.to raise_error("after")
+      ensure
+        client&.close
+      end
+    end
+
+    it "raises rather than crashing when query_each hits an undecodable type" do
+      client = ClickhouseNative::Client.new(**CH_KWARGS)
+
+      expect { client.query_each("SELECT generateUUIDv4()") { |_r| nil } }
+        .to raise_error(ClickhouseNative::UnsupportedTypeError)
+
+      expect { raise "after" }.to raise_error("after")
+    ensure
+      client&.close
+    end
   end
 
   describe "#describe_table" do
@@ -805,6 +836,23 @@ RSpec.describe ClickhouseNative::Pool, :clickhouse do
       # pool_size is 1, so a client that was not discarded comes straight back.
       p.with { |c| expect(c).not_to be(client) }
       expect { client.ping }.to raise_error(ClickhouseNative::ConnectionError)
+    end
+
+    # #query and #query_value only grew an unblock function when they started
+    # releasing the GVL: before that a kill could not land until the read had
+    # finished on its own. Now it shuts the socket down mid-read, so the client
+    # has to be discarded rather than handed back mid-reply.
+    %i[query query_value].each do |reader|
+      it "discards the client when a #{reader} is killed mid-read" do
+        p = described_class.new(**CH_KWARGS, pool_size: 1)
+        client, thread = start_query(p) { |c| c.public_send(reader, slow_query) }
+
+        thread.kill
+        thread.join
+
+        p.with { |c| expect(c).not_to be(client) }
+        expect { client.ping }.to raise_error(ClickhouseNative::ConnectionError)
+      end
     end
 
     # The reply the killed query abandoned must not become the next

@@ -147,11 +147,11 @@ client.query("SELECT 1 AS a, 'x' AS b")
 # => [{ a: 1, b: "x" }]
 ```
 
-Returns `[]` for empty results. Use `#query_each` for large results or when you need to release the GVL mid-iteration.
+Returns `[]` for empty results. Releases the GVL for the duration of the server round-trip, taking it back only to build each block's rows. Use `#query_each` for large results, which hands rows to your block as they arrive instead of buffering them all.
 
 ### `#query_value(sql, settings: {})`
 
-Returns the first cell of the first row, or `nil` if there are no rows.
+Returns the first cell of the first row, or `nil` if there are no rows. Releases the GVL like `#query`.
 
 ```ruby
 client.query_value("SELECT count() FROM events")   # => 1337
@@ -359,7 +359,9 @@ client.query("SELECT 1")
 
 ## Concurrency
 
-The extension releases the GVL around every blocking `clickhouse-cpp` call (`execute`, `query`, `query_value`, `query_each`, `insert_block`, `ping`), so a `Pool` of size N genuinely runs N concurrent ClickHouse queries from N Ruby threads.
+The extension releases the GVL around every blocking `clickhouse-cpp` call — `execute`, `query`, `query_value`, `query_each`, `insert_block`, `ping`, and the connect in `Client.new` and `#reset_connection` — so a `Pool` of size N genuinely runs N concurrent ClickHouse queries from N Ruby threads, and no single call can stall unrelated threads.
+
+The readers that build Ruby objects (`query`, `query_value`, `query_each`) take the GVL back per result block and drop it again, so a long read stays interruptible: a `Thread#kill` or `Timeout` lands on it rather than waiting for the read to finish, and the connection it was using is discarded rather than reused mid-reply.
 
 `benchmark/threaded.rb` demonstrates this with a `SELECT sleep(0.1)` workload. Example output:
 

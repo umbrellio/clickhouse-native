@@ -837,13 +837,20 @@ static void* reset_no_gvl(void* data) {
 // ResetConnection() opens a fresh socket and re-handshakes, so it blocks on the
 // network exactly like a query does. Every error path calls it, which is when
 // the server is least likely to answer promptly - the worst moment to be
-// holding the GVL. Failures stay swallowed: callers are already unwinding, and
-// the pool discards the client either way. No unblock function: there is no
-// in-flight query to cancel, and the half-built connection is this thread's.
+// holding the GVL. No unblock function: there is no in-flight query to cancel,
+// and the half-built connection is this thread's.
+//
+// _gvl2, not the ordinary one: every caller is already reporting some other
+// error, and the ordinary variant checks pending interrupts as it retakes the
+// GVL and can longjmp out. That would jump between an rb_protect tag and the
+// rb_jump_tag meant to re-raise it, or out of the active catch handler in
+// insert_block, and would lose the error the caller came here to report. This
+// stays as inert as the plain call it replaces: failures are swallowed, since
+// the pool discards the client either way.
 static void reset_connection_no_gvl(Client* client) {
     if (!client) return;
     ResetNoGVL args{client, nullptr};
-    rb_thread_call_without_gvl(reset_no_gvl, &args, nullptr, nullptr);
+    rb_thread_call_without_gvl2(reset_no_gvl, &args, nullptr, nullptr);
 }
 
 // Client.new(host:, port:, database:, user:, password:)
@@ -995,6 +1002,7 @@ struct CollectState {
     bool seen;
     std::vector<ID> col_ids;
     int exc_tag;
+    std::exception_ptr cpp_err;
     bool aborted;
 };
 
@@ -1012,36 +1020,46 @@ struct QueryNoGVL {
 };
 }  // namespace
 
+// The decode throw is caught here, inside the frame rb_protect calls, so it
+// never unwinds through rb_protect itself - doing that walks a setjmp frame
+// whose epilogue never runs and takes the interpreter down. Carried out via
+// state instead; run_buffered_query rethrows it after the no-GVL region.
 static VALUE collect_rows_body(VALUE arg) {
     auto* args = reinterpret_cast<CollectBlockArgs*>(arg);
     const Block& block = *args->block;
     auto* state = args->state;
-    size_t ncols = block.GetColumnCount();
-    size_t nrows = block.GetRowCount();
-    if (nrows == 0 || ncols == 0) return Qnil;
 
-    if (state->first_only) {
-        if (!state->seen) {
-            state->out = value_at(block[0], 0, block.GetColumnType(0));
-            state->seen = true;
-        }
-        return Qnil;
-    }
+    try {
+        size_t ncols = block.GetColumnCount();
+        size_t nrows = block.GetRowCount();
+        if (nrows == 0 || ncols == 0) return Qnil;
 
-    if (state->col_ids.empty()) {
-        state->col_ids.reserve(ncols);
-        for (size_t i = 0; i < ncols; i++) {
-            const std::string& name = block.GetColumnName(i);
-            state->col_ids.push_back(rb_intern2(name.data(), name.size()));
+        if (state->first_only) {
+            if (!state->seen) {
+                state->out = value_at(block[0], 0, block.GetColumnType(0));
+                state->seen = true;
+            }
+            return Qnil;
         }
-    }
-    for (size_t r = 0; r < nrows; r++) {
-        VALUE h = rb_hash_new();
-        for (size_t cc = 0; cc < ncols; cc++) {
-            rb_hash_aset(h, ID2SYM(state->col_ids[cc]),
-                         value_at(block[cc], r, block.GetColumnType(cc)));
+
+        if (state->col_ids.empty()) {
+            state->col_ids.reserve(ncols);
+            for (size_t i = 0; i < ncols; i++) {
+                const std::string& name = block.GetColumnName(i);
+                state->col_ids.push_back(rb_intern2(name.data(), name.size()));
+            }
         }
-        rb_ary_push(state->rows, h);
+        for (size_t r = 0; r < nrows; r++) {
+            VALUE h = rb_hash_new();
+            for (size_t cc = 0; cc < ncols; cc++) {
+                rb_hash_aset(h, ID2SYM(state->col_ids[cc]),
+                             value_at(block[cc], r, block.GetColumnType(cc)));
+            }
+            rb_ary_push(state->rows, h);
+        }
+    } catch (...) {
+        state->cpp_err = std::current_exception();
+        state->aborted = true;
     }
     return Qnil;
 }
@@ -1083,12 +1101,22 @@ static VALUE run_buffered_query(VALUE self, int argc, VALUE* argv, bool first_on
     CHClient* c = as_client(self);
     if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
 
-    CollectState state{first_only ? Qnil : rb_ary_new(), Qnil, first_only, false, {}, 0, false};
+    // `state` lives on this thread's machine stack, and that is what marks
+    // state.rows and state.out while the GVL is dropped below: the GC scans the
+    // stack conservatively, and the context saved at the release covers the
+    // no-GVL window. Moving CollectState off the stack would remove the only
+    // thing keeping the result alive.
+    CollectState state{first_only ? Qnil : rb_ary_new(), Qnil,
+                       first_only, false, {}, 0, nullptr, false};
     Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
     apply_default_settings(q, c);
     apply_read_settings(q, kwargs);
     q.OnDataCancelable([&state](const Block& block) -> bool {
         if (state.aborted) return false;
+        // query_value keeps reading to leave the connection clean, but has
+        // nothing left to do once it holds its cell - taking the GVL per block
+        // to discard it costs a round trip each time on a large result.
+        if (state.first_only && state.seen) return true;
         CollectBlockArgs ca{&block, &state};
         rb_thread_call_with_gvl(with_gvl_collect, &ca);
         return !state.aborted;
@@ -1097,6 +1125,13 @@ static VALUE run_buffered_query(VALUE self, int argc, VALUE* argv, bool first_on
 
     rb_thread_call_without_gvl(query_no_gvl, &args, query_unblock, &args);
 
+    // A decode throw caught in the data callback is the real error; the read
+    // that follows it only reports the abort, so this is checked first.
+    if (state.cpp_err) {
+        reset_connection_no_gvl(c->client.get());
+        try { std::rethrow_exception(state.cpp_err); }
+        catch (const std::exception& e) { raise_mapped_ex(e); }
+    }
     if (args.err) {
         if (!args.cancelled) reset_connection_no_gvl(c->client.get());
         if (state.exc_tag) rb_jump_tag(state.exc_tag);
@@ -1108,11 +1143,7 @@ static VALUE run_buffered_query(VALUE self, int argc, VALUE* argv, bool first_on
         rb_jump_tag(state.exc_tag);
     }
 
-    VALUE result = first_only ? state.out : state.rows;
-    // The result is only reachable through this frame while the GVL is dropped
-    // above; keep the slot alive across that window.
-    RB_GC_GUARD(result);
-    return result;
+    return first_only ? state.out : state.rows;
 }
 
 static VALUE ch_client_query(int argc, VALUE* argv, VALUE self) {
@@ -1231,6 +1262,7 @@ struct QueryEachState {
     VALUE user_proc;
     std::vector<ID> col_ids;
     int exc_tag;
+    std::exception_ptr cpp_err;
     bool aborted;
 };
 
@@ -1248,27 +1280,35 @@ struct QueryEachNoGVL {
 };
 }  // namespace
 
+// See collect_rows_body: the decode throw is caught inside this frame so it
+// never unwinds through rb_protect.
 static VALUE yield_rows_body(VALUE arg) {
     auto* args = reinterpret_cast<YieldBlockArgs*>(arg);
     const Block& block = *args->block;
     auto* state = args->state;
-    size_t ncols = block.GetColumnCount();
-    size_t nrows = block.GetRowCount();
-    if (nrows == 0) return Qnil;
-    if (state->col_ids.empty() && ncols > 0) {
-        state->col_ids.reserve(ncols);
-        for (size_t i = 0; i < ncols; i++) {
-            const std::string& name = block.GetColumnName(i);
-            state->col_ids.push_back(rb_intern2(name.data(), name.size()));
+
+    try {
+        size_t ncols = block.GetColumnCount();
+        size_t nrows = block.GetRowCount();
+        if (nrows == 0) return Qnil;
+        if (state->col_ids.empty() && ncols > 0) {
+            state->col_ids.reserve(ncols);
+            for (size_t i = 0; i < ncols; i++) {
+                const std::string& name = block.GetColumnName(i);
+                state->col_ids.push_back(rb_intern2(name.data(), name.size()));
+            }
         }
-    }
-    for (size_t r = 0; r < nrows; r++) {
-        VALUE h = rb_hash_new();
-        for (size_t cc = 0; cc < ncols; cc++) {
-            rb_hash_aset(h, ID2SYM(state->col_ids[cc]),
-                         value_at(block[cc], r, block.GetColumnType(cc)));
+        for (size_t r = 0; r < nrows; r++) {
+            VALUE h = rb_hash_new();
+            for (size_t cc = 0; cc < ncols; cc++) {
+                rb_hash_aset(h, ID2SYM(state->col_ids[cc]),
+                             value_at(block[cc], r, block.GetColumnType(cc)));
+            }
+            rb_funcall(state->user_proc, rb_intern("call"), 1, h);
         }
-        rb_funcall(state->user_proc, rb_intern("call"), 1, h);
+    } catch (...) {
+        state->cpp_err = std::current_exception();
+        state->aborted = true;
     }
     return Qnil;
 }
@@ -1309,7 +1349,7 @@ static VALUE ch_client_query_each(int argc, VALUE* argv, VALUE self) {
     CHClient* c = as_client(self);
     if (!c->client) rb_raise(err_connection, "clickhouse-native: client is closed");
 
-    QueryEachState state{rb_block_proc(), {}, 0, false};
+    QueryEachState state{rb_block_proc(), {}, 0, nullptr, false};
     Query q(std::string(RSTRING_PTR(rb_sql), RSTRING_LEN(rb_sql)));
     apply_default_settings(q, c);
     apply_read_settings(q, kwargs);
@@ -1323,6 +1363,13 @@ static VALUE ch_client_query_each(int argc, VALUE* argv, VALUE self) {
 
     rb_thread_call_without_gvl(query_each_no_gvl, &args, query_each_unblock, &args);
 
+    // A decode throw caught in the data callback is the real error; the read
+    // that follows it only reports the abort, so this is checked first.
+    if (state.cpp_err) {
+        reset_connection_no_gvl(c->client.get());
+        try { std::rethrow_exception(state.cpp_err); }
+        catch (const std::exception& e) { raise_mapped_ex(e); }
+    }
     if (args.err) {
         if (!args.cancelled) reset_connection_no_gvl(c->client.get());
         if (state.exc_tag) rb_jump_tag(state.exc_tag);
